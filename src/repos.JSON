@@ -5,44 +5,33 @@
   {"owner": "kubeflow", "repo": "kubeflow"},
   {"owner": "huggingface", "repo": "transformers"},
   {"owner": "pytorch", "repo": "pytorch"},
-
-  
   {"owner": "tensorflow", "repo": "tensorflow"},
-  {"owner": "jax-ml", "repo": "jax"},
   {"owner": "scikit-learn", "repo": "scikit-learn"},
-  {"owner": "keras-team", "repo": "keras"},
-
-
-
-
   {"owner": "run-llama", "repo": "llama_index"},
   {"owner": "langchain-ai", "repo": "langchain"},
-  
-  {"owner": "ray-project", "repo": "ray"},
-  {"owner": "feast-dev", "repo": "feast"},
-  {"owner": "wandb", "repo": "wandb"},
-
- 
-
-  {"owner": "openai", "repo": "triton"},
-  {"owner": "llvm", "repo": "llvm-project"},
-  {"owner": "oneapi-src", "repo": "oneDNN"},
-  {"owner": "ROCm", "repo": "MIOpen"},
-  {"owner": "NVIDIA", "repo": "cutlass"},
-
-  {"owner": "torvalds", "repo": "linux"},
-  {"owner": "freebsd", "repo": "freebsd-src"},
-  {"owner": "apple-oss-distributions", "repo": "xnu"},
-  {"owner": "redox-os", "repo": "redox"},
 
   {"owner": "apache", "repo": "spark"},
   {"owner": "apache", "repo": "kafka"},
   {"owner": "apache", "repo": "flink"},
+  {"owner": "apache", "repo": "beam"},
   {"owner": "dask", "repo": "dask"},
-  {"owner": "prefecthq", "repo": "prefect"},
+  {"owner": "duckdb", "repo": "duckdb"},
 
-  {"owner": "kubernetes", "repo": "kubernetes"},
-  {"owner": "moby", "repo": "moby"},
-  {"owner": "containerd", "repo": "containerd"},
-  {"owner": "hashicorp", "repo": "terraform"}
+  {"owner": "qdrant", "repo": "qdrant"},
+  {"owner": "chroma-core", "repo": "chroma"},
+  {"owner": "milvus-io", "repo": "milvus"},
+  {"owner": "weaviate", "repo": "weaviate"},
+  {"owner": "facebookresearch", "repo": "faiss"},
+
+  {"owner": "prefecthq", "repo": "prefect"},
+  {"owner": "dagster-io", "repo": "dagster"},
+  {"owner": "wandb", "repo": "wandb"},
+  {"owner": "vllm-project", "repo": "vllm"},
+  {"owner": "microsoft", "repo": "DeepSpeed"},
+
+  {"owner": "openai", "repo": "triton"},
+  {"owner": "llvm", "repo": "llvm-project"},
+  {"owner": "delta-io", "repo": "delta"},
+  {"owner": "apache", "repo": "iceberg"},
+  {"owner": "NVIDIA", "repo": "Megatron-LM"}
 ]
