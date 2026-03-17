@@ -1,4 +1,5 @@
 import os, requests, json, uuid, boto3
+import time
 from typing import Optional 
 from datetime import datetime, timezone 
 
@@ -82,6 +83,42 @@ def parse_link_header(link_header: Optional[str]) -> dict:
     return links
 
 
+
+def safe_request(url: str, headers: dict, params=None, retries=3):
+    for attempt in range(retries):
+        try:
+            response = requests.get(
+                url,
+                headers=headers,
+                params=params,
+                timeout=30
+            )
+
+            # Rate limit handling
+            if response.status_code in (429, 403):
+                remaining = response.headers.get("X-RateLimit-Remaining")
+                reset_ts = response.headers.get("X-RateLimit-Reset")
+
+                if remaining == "0" and reset_ts:
+                    now_ts = int(time.time())
+                    sleep_seconds = max(int(reset_ts) - now_ts + 5, 5)
+                    print(f"Rate limit hit. Sleeping for {sleep_seconds} seconds...")
+                    time.sleep(sleep_seconds)
+                    continue
+
+            response.raise_for_status()
+            return response
+
+        except requests.exceptions.RequestException as e:
+            print(f"Request failed: {e}")
+
+            if attempt < retries - 1:
+                wait = 2 ** attempt
+                print(f"Retrying in {wait}s...")
+                time.sleep(wait)
+            else:
+                raise
+
 def fetch_paginated_and_upload(owner: str, repo: str, endpoint: str,params: dict = None, use_since: bool = True):
     """
     Generic fetcher that follows Link header and uploads each page to S3 as a separate JSON file.
@@ -91,8 +128,7 @@ def fetch_paginated_and_upload(owner: str, repo: str, endpoint: str,params: dict
     params.setdefault("per_page", 100)
     params.setdefault("state", "all")
 
-    now = datetime.now(timezone.utc)
-    fetched_at = now.isoformat()
+    
 
     # attempt to read checkpoint
     last_run = s3_checkpoint_read(owner, repo, endpoint)
@@ -104,9 +140,11 @@ def fetch_paginated_and_upload(owner: str, repo: str, endpoint: str,params: dict
     base_url = f"https://api.github.com/repos/{owner}/{repo}"
     url = f"{base_url}/{endpoint}"
     while url:
-        response = requests.get(url, headers=get_headers(), params=params if "?" not in url else None, timeout=30)
+        response = safe_request(url, headers=get_headers(), params=params if "?" not in url else None)
         # handle rate-limit politely: raise and let caller / Airflow retry
         response.raise_for_status()
+        now = datetime.now(timezone.utc)
+        fetched_at = now.isoformat()
 
         data = response.json()
         # prepare payload (metadata + raw page)
@@ -141,23 +179,42 @@ def fetch_paginated_and_upload(owner: str, repo: str, endpoint: str,params: dict
         else:
             url = None
 
+    now = datetime.now(timezone.utc)
+    finished_at = now.isoformat()
+
     # write checkpoint (we set to current run time)
-    s3_checkpoint_write(owner, repo, endpoint, fetched_at)
-    print(f"Checkpoint for {endpoint} updated to {fetched_at}")
+    s3_checkpoint_write(owner, repo, endpoint, finished_at)
+    print(f"Checkpoint for {endpoint} updated to {finished_at}")
 
 
-
-
+def load_repos(filepath: str) -> list[dict]:
+    with open(filepath, "r") as f:
+        return json.load(f)
+    
 
 def main():
+    repos = load_repos("/Users/kikihan/github_data_ingestion/src/repos.JSON")
+
+    '''for repo_info in repos:
+        owner = repo_info["owner"]
+        repo = repo_info["repo"]
+
+        print(f"Processing {owner}/{repo}...")'''
+
+    fetch_paginated_and_upload("chroma-core", "chroma", endpoint="issues", use_since=False)
+    # fetch_paginated_and_upload(owner, repo, endpoint="commits", use_since=False)
+       
+
+'''def main():
     #testing("https://api.github.com/repos/apache/airflow")
 
-    owner = "tensorflow"
-    repo = "tensorflow" 
-    endpoint = "commits"
-    fetch_paginated_and_upload(owner, repo, endpoint,use_since=False)
+    owner = "dagster-io"
+    repo = "dagster"
+    
+    fetch_paginated_and_upload(owner, repo, endpoint="issues", use_since=False)
+    fetch_paginated_and_upload(owner, repo, endpoint="commits", use_since=False)
 
-
+'''
 
 
 
@@ -183,7 +240,7 @@ def testing(url:str) -> dict:
         "X-GitHub-Api-Version": "2022-11-28",
     }
     
-    response = requests.get(url, headers=headers, timeout=30)
+    response = requests.get(url, headers=headers, timeout=60)
     response.raise_for_status()
     
     print(json.dumps(dict(response.headers), indent=2))
