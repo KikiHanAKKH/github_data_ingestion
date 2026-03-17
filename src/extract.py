@@ -55,7 +55,9 @@ def s3_checkpoint_write(owner: str, repo: str, endpoint: str, iso_ts: str) -> No
     payload = {"last_run": iso_ts}
     s3.put_object(Bucket=S3_BUCKET, Key=key, Body=json.dumps(payload).encode("utf-8"))
 
-
+def s3_repo_metadata_write(owner: str, repo: str, data: dict) -> None:
+    key = f"{S3_PREFIX}/repo_data/{owner}/{repo}.json"
+    s3.put_object(Bucket=S3_BUCKET, Key=key, Body=json.dumps(data).encode("utf-8"))
 
 
 def parse_link_header(link_header: Optional[str]) -> dict:
@@ -191,30 +193,31 @@ def load_repos(filepath: str) -> list[dict]:
     with open(filepath, "r") as f:
         return json.load(f)
     
+def upload_repo_metadata(owner: str, repo: str) -> None:
+    response = safe_request(f"https://api.github.com/repos/{owner}/{repo}", headers=get_headers())
+    payload = {
+        "owner": owner,
+        "repo": repo,
+        "fetched_at": datetime.now(timezone.utc).isoformat(),
+        "endpoint": "repo_metadata",
+        "data": response.json()
+    }
+    s3_repo_metadata_write(owner, repo, payload)
+
 
 def main():
     repos = load_repos("/Users/kikihan/github_data_ingestion/src/repos.JSON")
 
-    '''for repo_info in repos:
+    for repo_info in repos:
         owner = repo_info["owner"]
         repo = repo_info["repo"]
 
-        print(f"Processing {owner}/{repo}...")'''
-
-    fetch_paginated_and_upload("chroma-core", "chroma", endpoint="issues", use_since=False)
-    # fetch_paginated_and_upload(owner, repo, endpoint="commits", use_since=False)
+        print(f"Processing {owner}/{repo}...")
+        upload_repo_metadata(owner, repo)
+        fetch_paginated_and_upload(owner, repo, endpoint="issues", use_since=False)
+        fetch_paginated_and_upload(owner, repo, endpoint="commits", use_since=False)
        
 
-'''def main():
-    #testing("https://api.github.com/repos/apache/airflow")
-
-    owner = "dagster-io"
-    repo = "dagster"
-    
-    fetch_paginated_and_upload(owner, repo, endpoint="issues", use_since=False)
-    fetch_paginated_and_upload(owner, repo, endpoint="commits", use_since=False)
-
-'''
 
 
 
