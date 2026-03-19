@@ -2,6 +2,9 @@ import os, requests, json, uuid, boto3
 import time
 from typing import Optional 
 from datetime import datetime, timezone 
+from concurrent.futures import ThreadPoolExecutor, as_completed
+from urllib.parse import urlparse, parse_qs
+
 
 # in local dev u should do this, in production env vars are 
 from dotenv import load_dotenv
@@ -12,6 +15,7 @@ S3_BUCKET = os.getenv("S3_BUCKET")
 AWS_REGION = os.getenv("AWS_REGION")
 GITHUB_TOKEN = os.getenv("GITHUB_TOKEN")
 S3_PREFIX = os.getenv("S3_PREFIX")
+REPO_JSON_PATH = os.getenv("REPO_JSON_PATH")
 
 
 s3 = boto3.client("s3", region_name=AWS_REGION)
@@ -41,7 +45,7 @@ def s3_checkpoint_read(owner: str, repo: str, endpoint: str) -> Optional[str]:
         res = s3.get_object(Bucket=S3_BUCKET, Key=key)
         body = res["Body"].read().decode("utf-8")
         obj = json.loads(body)
-        return obj.get("last_run")
+        return obj.get("last_run",None)
     except s3.exceptions.NoSuchKey:
         return None
     except Exception:
@@ -56,33 +60,9 @@ def s3_checkpoint_write(owner: str, repo: str, endpoint: str, iso_ts: str) -> No
     s3.put_object(Bucket=S3_BUCKET, Key=key, Body=json.dumps(payload).encode("utf-8"))
 
 def s3_repo_metadata_write(owner: str, repo: str, data: dict) -> None:
-    key = f"{S3_PREFIX}/repo_data/{owner}/{repo}.json"
+    key = f"{S3_PREFIX}/repo_metadata/{owner}/{repo}.json"
     s3.put_object(Bucket=S3_BUCKET, Key=key, Body=json.dumps(data).encode("utf-8"))
 
-
-def parse_link_header(link_header: Optional[str]) -> dict:
-    """
-    Parse the Link header into a dict of rel -> url
-    Example Link header:
-    <https://api.github.com/resource?page=2>; rel="next", <...>; rel="last"
-    Returns: {"next": "...", "last": "..."}
-    """
-    if not link_header:
-        return {}
-    parts = link_header.split(",")
-    links = {}
-    for part in parts:
-        section = part.strip().split(";")
-        if len(section) < 2:
-            continue
-        url_part = section[0].strip()
-        rel_part = section[1].strip()
-        # url_part: <https://...>
-        url = url_part[url_part.find("<")+1 : url_part.rfind(">")]
-        # rel_part: rel="next"
-        rel = rel_part.split("=")[1].strip('"')
-        links[rel] = url
-    return links
 
 
 
@@ -121,72 +101,180 @@ def safe_request(url: str, headers: dict, params=None, retries=3):
             else:
                 raise
 
-def fetch_paginated_and_upload(owner: str, repo: str, endpoint: str,params: dict = None, use_since: bool = True):
+
+def fetch_page_and_upload(owner: str, repo: str, endpoint: str, page: int, params: dict = None, incremental: bool = True,since_value: Optional[str] = None) -> dict:
     """
-    Generic fetcher that follows Link header and uploads each page to S3 as a separate JSON file.
-    If use_since and a checkpoint exists, adds 'since' param (ISO string) to the params.
+    Fetch one page from GitHub and upload it to S3.
+
+    Returns metadata about the page:
+    {
+        "page": int,
+        "count": int,
+        "next_url": str | None,
+        "response_url": str
+    }
     """
     params = params.copy() if params else {}
     params.setdefault("per_page", 100)
-    params.setdefault("state", "all")
-
-    
-
-    # attempt to read checkpoint
-    last_run = s3_checkpoint_read(owner, repo, endpoint)
-    if last_run and use_since:
-        # GitHub supports 'since' for many list endpoints (issues, commits).
-        params["since"] = last_run
-
-    # initial URL
-    base_url = f"https://api.github.com/repos/{owner}/{repo}"
-    url = f"{base_url}/{endpoint}"
-    while url:
-        response = safe_request(url, headers=get_headers(), params=params if "?" not in url else None)
-        # handle rate-limit politely: raise and let caller / Airflow retry
-        response.raise_for_status()
-        now = datetime.now(timezone.utc)
-        fetched_at = now.isoformat()
-
-        data = response.json()
-        # prepare payload (metadata + raw page)
-        payload = {
-            "owner": owner,
-            "repo": repo,
-            "fetched_at": fetched_at,
-            "endpoint": endpoint,
-            "params": params,
-            "url": url,
-            "count": len(data),
-            "data": data,
-        }
-
-        # S3 key: keep tidy partitioning
-        key = (
-            f"{S3_PREFIX}/raw_{owner}_{repo}_{endpoint}/"
-            f"yyyy={now.year:04d}/mm={now.month:02d}/dd={now.day:02d}/"
-            f"hh={now.hour:02d}/{endpoint}_page_{uuid.uuid4()}.json"
-        )
-
-        upload_to_s3(json.dumps(payload).encode("utf-8"), key)
-        print(f"Uploaded {endpoint} page to s3://{S3_BUCKET}/{key} (count={len(data)})")
-
-        # parse link header for next url
-        links = parse_link_header(response.headers.get("Link"))
-        next_url = links.get("next")
-        if next_url:
-            url = next_url
-            # when following link header, don't pass params again (they're in the URL)
-            params = {}
-        else:
-            url = None
+    params["page"] = page
+    if endpoint == "issues":
+        params.setdefault("state", "all")
+    if since_value and "since" not in params:
+        params["since"] = since_value
+    url = f"https://api.github.com/repos/{owner}/{repo}/{endpoint}"
+    response = safe_request(url, headers=get_headers(), params=params)
 
     now = datetime.now(timezone.utc)
-    finished_at = now.isoformat()
+    fetched_at = now.isoformat()
+    data = response.json()
 
-    # write checkpoint (we set to current run time)
+    payload = {
+        "owner": owner,
+        "repo": repo,
+        "fetched_at": fetched_at,
+        "endpoint": endpoint,
+        "params": params,
+        "url": response.url,
+        "count": len(data),
+        "data": data,
+    }
+
+    key = (
+        f"{S3_PREFIX}/raw_{owner}_{repo}_{endpoint}/"
+        f"yyyy={now.year:04d}/mm={now.month:02d}/dd={now.day:02d}/"
+        f"hh={now.hour:02d}/{endpoint}_page_{page}_{uuid.uuid4()}.json"
+    )
+
+    upload_to_s3(json.dumps(payload).encode("utf-8"), key)
+    print(f"Uploaded {endpoint} page {page} to s3://{S3_BUCKET}/{key} (count={len(data)})")
+
+    next_url = response.links.get("next", {}).get("url")
+
+    return {
+        "page": page,
+        "count": len(data),
+        "next_url": next_url,
+        "response_url": response.url,
+    }
+
+
+
+def fetch_paginated_and_upload_sequential(owner: str, repo: str, endpoint: str, params: dict = None, incremental: bool = True) -> None:
+    page = 1
+    total_items = 0
+    since_value = s3_checkpoint_read(owner, repo, endpoint) if incremental else None
+
+    while True:
+        result = fetch_page_and_upload(
+            owner=owner,
+            repo=repo,
+            endpoint=endpoint,
+            page=page,
+            params=params,
+            incremental=incremental,
+            since_value=since_value
+        )
+
+        total_items += result["count"]
+
+        if not result["next_url"]:
+            break
+
+        page += 1
+
+    finished_at = datetime.now(timezone.utc).isoformat()
+    s3_checkpoint_write(owner, repo, endpoint, finished_at)
+    print(f"Checkpoint for {owner}/{repo} {endpoint} updated to {finished_at}")
+    print(f"Finished sequential fetch for {owner}/{repo} {endpoint}: total_items={total_items}")
+
+
+
+def get_total_pages(owner: str, repo: str, endpoint: str, params: dict = None,incremental = False, since_value: Optional[str] = None) -> Optional[int]:
+    params = params.copy() if params else {}
+    params.setdefault("per_page", 100)
+    params["page"] = 1
+    if endpoint == "issues":
+        params.setdefault("state", "all")
+    
+
+    
+    if since_value and incremental and "since" not in params:
+        params["since"] = since_value
+
+    url = f"https://api.github.com/repos/{owner}/{repo}/{endpoint}"
+    response = safe_request(url, headers=get_headers(), params=params)
+
+    if "last" in response.links:
+        last_url = response.links["last"]["url"]
+        parsed = urlparse(last_url)
+        page_str = parse_qs(parsed.query).get("page", ["1"])[0]
+        return int(page_str)
+
+    if "next" in response.links:
+        return None
+
+    data = response.json()
+    return 1 if data else 0
+
+
+# parallel only works for commits coz issues it doesn't hav a 'last' in its header, so we can't  know how many pages numbers we need to fetch 
+def fetch_paginated_and_upload_parallel(owner: str, repo: str, endpoint: str, params: dict = None, incremental: bool = True, max_workers: int = 8) -> None:
+    since_value = s3_checkpoint_read(owner, repo, endpoint) if incremental else None
+    total_pages = get_total_pages(
+        owner=owner,
+        repo=repo,
+        endpoint=endpoint,
+        params=params,
+        incremental=incremental,
+        since_value = since_value
+    )
+
+    print(f"{owner}/{repo} {endpoint}: total_pages={total_pages}")
+
+    if total_pages == 0:
+        print(f"No data found for {owner}/{repo} {endpoint}")
+        return
+    
+    if total_pages is None:
+        print(f"Cannot determine total pages for {owner}/{repo} {endpoint}, falling back to sequential fetch")
+        fetch_paginated_and_upload_sequential(owner, repo, endpoint, params, incremental)
+        return 
+
+    completed_pages = 0
+    total_items = 0
+    start_time = time.time()
+
+    with ThreadPoolExecutor(max_workers=max_workers) as executor:
+        futures = {
+            executor.submit(fetch_page_and_upload, owner, repo, endpoint, page, params, incremental,since_value): page
+            for page in range(1, total_pages + 1)
+        }
+
+        for future in as_completed(futures):
+            page = futures[future]
+            try:
+                result = future.result()
+                completed_pages += 1
+                total_items += result["count"]
+
+                elapsed = time.time() - start_time
+                avg_time = elapsed / completed_pages
+                remaining_pages = total_pages - completed_pages
+                eta_seconds = remaining_pages * avg_time
+
+                print(
+                    f"{owner}/{repo} {endpoint}: "
+                    f"{completed_pages}/{total_pages} pages done | "
+                    f"last_page={page} | eta={eta_seconds:.1f}s"
+                )
+            except Exception as e:
+                print(f"Failed page {page} for {owner}/{repo} {endpoint}: {e}")
+                raise
+
+    finished_at = datetime.now(timezone.utc).isoformat()
     s3_checkpoint_write(owner, repo, endpoint, finished_at)
     print(f"Checkpoint for {endpoint} updated to {finished_at}")
+    print(f"Finished parallel fetch for {owner}/{repo} {endpoint}: total_items={total_items}")
 
 
 def load_repos(filepath: str) -> list[dict]:
@@ -206,44 +294,31 @@ def upload_repo_metadata(owner: str, repo: str) -> None:
 
 
 def main():
-    repos = load_repos("/Users/kikihan/github_data_ingestion/src/repos.JSON")
-
-    for repo_info in repos:
+    
+    # for backfills, we can use parallel fetching for commits
+    # IMPORTANT: check first if the response has 'last' header, only use parallel when there is 'last' in the response header or it won't work coz we need total pages number 
+    fetch_paginated_and_upload_sequential("pallets", "flask", endpoint="commits", incremental=False)
+    
+    repos = load_repos(REPO_JSON_PATH)
+    
+    '''for repo_info in repos:
         owner = repo_info["owner"]
         repo = repo_info["repo"]
 
         print(f"Processing {owner}/{repo}...")
         upload_repo_metadata(owner, repo)
-        fetch_paginated_and_upload(owner, repo, endpoint="issues", use_since=False)
-        fetch_paginated_and_upload(owner, repo, endpoint="commits", use_since=False)
-       
+        fetch_paginated_and_upload_sequential(owner, repo, endpoint="issues", incremental=True)
+        fetch_paginated_and_upload_sequential(owner, repo, endpoint="commits", incremental=True)   '''    
 
 
-
-
-
-def testing(url:str) -> dict:
-    """
-    Fetch repository metadata from the GitHub REST API.
-
-    Args:
-        owner: GitHub username or organization.
-        repo: Repository name.
-
-    Returns:
-        Parsed JSON response as a dictionary.
-
-    Raises:
-        requests.HTTPError: If the request fails.
-    """
-    
+def testing() -> dict: 
     headers = {
         "Authorization": f"Bearer {GITHUB_TOKEN}",
         "Accept": "application/vnd.github+json",
         "X-GitHub-Api-Version": "2022-11-28",
     }
     
-    response = requests.get(url, headers=headers, timeout=60)
+    response = requests.get("https://api.github.com/repos/apache/airflow", headers=headers, timeout=60)
     response.raise_for_status()
     
     print(json.dumps(dict(response.headers), indent=2))
