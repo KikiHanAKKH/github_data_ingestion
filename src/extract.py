@@ -16,6 +16,11 @@ AWS_REGION = os.getenv("AWS_REGION")
 GITHUB_TOKEN = os.getenv("GITHUB_TOKEN")
 S3_PREFIX = os.getenv("S3_PREFIX")
 REPO_JSON_PATH = os.getenv("REPO_JSON_PATH")
+if not REPO_JSON_PATH:
+    REPO_JSON_PATH = os.path.join(
+            os.path.dirname(__file__),
+            "repos.json"
+        )
 
 
 s3 = boto3.client("s3", region_name=AWS_REGION)
@@ -102,7 +107,7 @@ def safe_request(url: str, headers: dict, params=None, retries=3):
                 raise
 
 
-def fetch_page_and_upload(owner: str, repo: str, endpoint: str, page: int, params: dict = None, incremental: bool = True,since_value: Optional[str] = None) -> dict:
+def fetch_page_and_upload(owner: str, repo: str, endpoint: str, page: Optional[int] = None, next_url: Optional[str] = None, params: dict = None, incremental: bool = True,since_value: Optional[str] = None) -> dict:
     """
     Fetch one page from GitHub and upload it to S3.
 
@@ -116,13 +121,19 @@ def fetch_page_and_upload(owner: str, repo: str, endpoint: str, page: int, param
     """
     params = params.copy() if params else {}
     params.setdefault("per_page", 100)
-    params["page"] = page
+    if page:
+        params["page"] = page
     if endpoint == "issues":
         params.setdefault("state", "all")
     if since_value and "since" not in params:
         params["since"] = since_value
-    url = f"https://api.github.com/repos/{owner}/{repo}/{endpoint}"
-    response = safe_request(url, headers=get_headers(), params=params)
+    
+    if not next_url:
+        url = f"https://api.github.com/repos/{owner}/{repo}/{endpoint}"
+        response = safe_request(url, headers=get_headers(), params=params)
+    else:
+        url = next_url
+        response = safe_request(url, headers=get_headers(), params=None)
 
     now = datetime.now(timezone.utc)
     fetched_at = now.isoformat()
@@ -163,21 +174,24 @@ def fetch_paginated_and_upload_sequential(owner: str, repo: str, endpoint: str, 
     page = 1
     total_items = 0
     since_value = s3_checkpoint_read(owner, repo, endpoint) if incremental else None
-
+    url = None
     while True:
         result = fetch_page_and_upload(
             owner=owner,
             repo=repo,
             endpoint=endpoint,
             page=page,
+            next_url=url,
             params=params,
             incremental=incremental,
             since_value=since_value
         )
 
         total_items += result["count"]
+        url = result["next_url"]
+        params = None
 
-        if not result["next_url"]:
+        if not url:
             break
 
         page += 1
@@ -246,7 +260,7 @@ def fetch_paginated_and_upload_parallel(owner: str, repo: str, endpoint: str, pa
 
     with ThreadPoolExecutor(max_workers=max_workers) as executor:
         futures = {
-            executor.submit(fetch_page_and_upload, owner, repo, endpoint, page, params, incremental,since_value): page
+            executor.submit(fetch_page_and_upload, owner=owner, repo=repo, endpoint=endpoint, page=page, params=params, incremental=incremental, since_value=since_value): page
             for page in range(1, total_pages + 1)
         }
 
@@ -297,18 +311,18 @@ def main():
     
     # for backfills, we can use parallel fetching for commits
     # IMPORTANT: check first if the response has 'last' header, only use parallel when there is 'last' in the response header or it won't work coz we need total pages number 
-    fetch_paginated_and_upload_sequential("pallets", "flask", endpoint="commits", incremental=False)
+    #fetch_paginated_and_upload_sequential("pallets", "flask", endpoint="commits", incremental=False)
     
     repos = load_repos(REPO_JSON_PATH)
     
-    '''for repo_info in repos:
+    for repo_info in repos:
         owner = repo_info["owner"]
         repo = repo_info["repo"]
 
         print(f"Processing {owner}/{repo}...")
         upload_repo_metadata(owner, repo)
-        fetch_paginated_and_upload_sequential(owner, repo, endpoint="issues", incremental=True)
-        fetch_paginated_and_upload_sequential(owner, repo, endpoint="commits", incremental=True)   '''    
+        fetch_paginated_and_upload_sequential(owner, repo, endpoint="issues", incremental=False)
+        fetch_paginated_and_upload_parallel(owner, repo, endpoint="commits", incremental=False)       
 
 
 def testing() -> dict: 
