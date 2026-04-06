@@ -189,10 +189,19 @@ logger = logging.getLogger(__name__)
 
 
 # s3a is the spark connector for s3, make sure hadoop-aws and aws-java-sdk dependencies are included in your Spark setup
-bronze_path = f"s3a://{S3_BUCKET}/{BRONZE_PREFIX}/repo_metadata/*.json"
+# bronze path is partitioned by date eg: .../repo_metadata/apache/airflow/yyyy=2026/mm=04/dd=06/sthsthsthsthsth.json
+bronze_path = f"s3a://{S3_BUCKET}/{BRONZE_PREFIX}/repo_metadata/*/*/yyyy=2026/mm=04/dd=06/"
 silver_path = f"s3a://{S3_BUCKET}/{SILVER_PREFIX}/repo_metadata/"
 
+'''
+If u want today's date
+today = datetime.now(timezone.utc)
 
+bronze_path = (
+    f"s3a://{S3_BUCKET}/{BRONZE_PREFIX}/repo_metadata/*/*/"
+    f"yyyy={today.year}/mm={today.month:02d}/dd={today.day:02d}/"
+)
+'''
 def read_bronze_data(spark):
     # read bronze data with explicit schema for stability
     logger.info(f"Reading bronze data from {bronze_path}")
