@@ -190,34 +190,51 @@ logger = logging.getLogger(__name__)
 
 # s3a is the spark connector for s3, make sure hadoop-aws and aws-java-sdk dependencies are included in your Spark setup
 # bronze path is partitioned by date eg: .../repo_metadata/apache/airflow/yyyy=2026/mm=04/dd=06/sthsthsthsthsth.json
-bronze_path = f"s3a://{S3_BUCKET}/{BRONZE_PREFIX}/repo_metadata/*/*/yyyy=2026/mm=04/dd=06/"
+bronze_path = f"s3a://{S3_BUCKET}/{BRONZE_PREFIX}/repo_metadata/*/*/yyyy=2026/mm=04/dd=06/" # with wildcards characters
 silver_path = f"s3a://{S3_BUCKET}/{SILVER_PREFIX}/repo_metadata/"
 
 '''
+bronze_path = f"s3a://{S3_BUCKET}/{BRONZE_PREFIX}/repo_metadata/"
+# looks for all json file under path recursively
+# if recursiveFileLookup set to true, do not provide filename pattern with wildcards (eg *.json) 
+# otherwise it will not read files in subdirectories
+# for now yes, coz i had both flat files and partiitons 
+return (
+    spark.read
+    .option("recursiveFileLookup", "true")
+    .json(bronze_path)
+    )
+'''
+'''
+# with wildcards characters 
+bronze_path = f"s3a://{S3_BUCKET}/{BRONZE_PREFIX}/repo_metadata/*/*/yyyy=2026/mm=04/dd=06/"
 If u want today's date
 today = datetime.now(timezone.utc)
-
 bronze_path = (
     f"s3a://{S3_BUCKET}/{BRONZE_PREFIX}/repo_metadata/*/*/"
     f"yyyy={today.year}/mm={today.month:02d}/dd={today.day:02d}/"
 )
 '''
+
+
 def read_bronze_data(spark):
     # read bronze data with explicit schema for stability
     logger.info(f"Reading bronze data from {bronze_path}")
-
-    return (
+    # recurisve mode disables inferring yyyy,mm,dd as partition columns
+    # but we have fetched_at in the json to derive snapshot date
+    return(
         spark.read
+        .option("recursiveFileLookup", "true")
         .schema(bronze_repo_metadata_schema)
         .json(bronze_path)
-    )
+        )
 
 def transform_repo_metadata(bronze_df, run_ts):
     return (
         bronze_df
         .select(
             F.col("data.id").alias("repo_id"),
-            F.col("data.full_name").alias("repo_name"),
+            F.col("data.full_name").alias("repo_full_name"),
             F.col("data.html_url").alias("repo_url"),
             F.col("data.description").alias("description"),
 
@@ -241,7 +258,7 @@ def transform_repo_metadata(bronze_df, run_ts):
             F.to_timestamp("fetched_at").alias("bronze_ingested_at")
         )
         .withColumn("silver_ingested_at", F.lit(run_ts).cast("timestamp"))
-        .withColumn("snapshot_date", F.to_date("silver_ingested_at"))
+        .withColumn("snapshot_date", F.to_date("bronze_ingested_at"))
 
         )
     
@@ -256,7 +273,8 @@ def write_silver_data(df):
         .format("parquet")
         .save(silver_path)
     )
-
+    # when u partition by snapshot_date, it will create subdirectories like snapshot_date=2026-04-06/ and put the parquet files there.
+    # no snapshot_date column in parquet, but when it's read back, snapshot_date will be a column again 
 
 def run_data_quality_checks(df, job_run_id):
     # check if silver DataFrame is empty
@@ -267,7 +285,7 @@ def run_data_quality_checks(df, job_run_id):
         raise ValueError("Data quality check failed: silver DataFrame is empty.")
 
     # check critical columns for nulls
-    required_columns = ["repo_id", "repo_name", "repo_url", "snapshot_date"]
+    required_columns = ["repo_id", "repo_full_name", "repo_url", "snapshot_date"]
     for col_name in required_columns:
         null_count = df.filter(F.col(col_name).isNull()).count()
         logger.info(f"job_run_id={job_run_id} null_count_{col_name}={null_count}")
@@ -298,12 +316,27 @@ def run_data_quality_checks(df, job_run_id):
     return silver_row_count
 
 def main(): 
+    spark = None
     job_run_id = str(uuid.uuid4())
     job_start_time = datetime.now(timezone.utc)
     job_status = "STARTED"
     logger.info(f"job_run_id={job_run_id} status={job_status} start_time={job_start_time.isoformat()}")
     try:
-        spark = SparkSession.builder.appName("repo_metadata_transform").getOrCreate()
+        # spark = SparkSession.builder.appName("repo_metadata_transform").getOrCreate()
+        spark = (
+            SparkSession.builder
+            .appName("repo_metadata_transform")
+            .config(
+                "spark.jars.packages",
+                "org.apache.hadoop:hadoop-aws:3.4.1,com.amazonaws:aws-java-sdk-bundle:1.12.262"
+            )
+            .config("spark.hadoop.fs.s3a.impl", "org.apache.hadoop.fs.s3a.S3AFileSystem")
+            .config(
+                "spark.hadoop.fs.s3a.aws.credentials.provider",
+                "com.amazonaws.auth.DefaultAWSCredentialsProviderChain"
+            )
+            .getOrCreate()
+        )
         spark.conf.set("spark.sql.sources.partitionOverwriteMode", "dynamic")
 
         bronze_df = read_bronze_data(spark)
@@ -344,7 +377,26 @@ def main():
             f"error={str(e)}"
         )
         raise
+    finally:
+        if spark is not None:
+            spark.stop()
 
 
 if __name__ == "__main__":
     main()
+
+
+
+'''
+# if u want only latest record per repo per day 
+from pyspark.sql.window import Window
+import pyspark.sql.functions as F
+
+window_spec = Window.partitionBy("repo_id", "snapshot_date").orderBy(F.col("bronze_ingested_at").desc())
+
+daily_latest_df = (
+    silver_df
+    .withColumn("rn", F.row_number().over(window_spec))
+    .filter(F.col("rn") == 1)
+    .drop("rn")
+)'''
