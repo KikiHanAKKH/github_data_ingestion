@@ -5,6 +5,8 @@ import uuid
 from datetime import datetime, timezone
 from dotenv import load_dotenv
 from pyspark.sql import SparkSession
+from pyspark.sql.window import Window
+
 from pyspark.sql.types import (
     StructType, StructField, StringType, LongType, BooleanType,
     ArrayType, MapType
@@ -216,7 +218,8 @@ bronze_path = (
 )
 '''
 
-
+# if we used year=2026/month=04/day=06/hour=12
+# sprak auto-parses these as columns
 def read_bronze_data(spark):
     # read bronze data with explicit schema for stability
     logger.info(f"Reading bronze data from {bronze_path}")
@@ -260,7 +263,24 @@ def transform_repo_metadata(bronze_df, run_ts):
         .withColumn("silver_ingested_at", F.lit(run_ts).cast("timestamp"))
         .withColumn("snapshot_date", F.to_date("bronze_ingested_at"))
 
-        )
+    )
+
+
+def dedupe(df):
+        
+    window_spec = (
+    Window
+    .partitionBy("repo_id", "snapshot_date")
+    .orderBy(F.col("bronze_ingested_at").desc())
+    )
+
+    deduped_df = (
+        df
+        .withColumn("rn", F.row_number().over(window_spec))
+        .filter(F.col("rn") == 1)
+        .drop("rn")
+    )
+    return deduped_df
     
 def write_silver_data(df):
     # overwrite by snapshot date if run multiple times a day 
@@ -350,9 +370,11 @@ def main():
 
         silver_repo_metadata_df = transform_repo_metadata(bronze_df, run_ts)
 
-        silver_row_count = run_data_quality_checks(silver_repo_metadata_df, job_run_id)
+        silver_repo_metadata_df_deduped = dedupe(silver_repo_metadata_df)
 
-        write_silver_data(silver_repo_metadata_df)
+        silver_row_count = run_data_quality_checks(silver_repo_metadata_df_deduped, job_run_id)
+
+        write_silver_data(silver_repo_metadata_df_deduped)
 
         job_end_time = datetime.now(timezone.utc)
         job_status = "SUCCESS"
