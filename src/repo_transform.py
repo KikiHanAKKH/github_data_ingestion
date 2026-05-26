@@ -267,7 +267,7 @@ def transform_repo_metadata(bronze_df, run_ts):
 
 
 def dedupe(df):
-        
+    # dedupe by repo_id and snapshot_date, keep the latest record based on bronze_ingested_at timestamp  
     window_spec = (
     Window
     .partitionBy("repo_id", "snapshot_date")
@@ -290,7 +290,7 @@ def write_silver_data(df):
         df.write
         .mode("overwrite")
         .partitionBy("snapshot_date")
-        .format("parquet")
+        .format("delta")
         .save(silver_path)
     )
     # when u partition by snapshot_date, it will create subdirectories like snapshot_date=2026-04-06/ and put the parquet files there.
@@ -347,9 +347,16 @@ def main():
             SparkSession.builder
             .appName("repo_metadata_transform")
             .config(
-                "spark.jars.packages",
-                "org.apache.hadoop:hadoop-aws:3.4.1,com.amazonaws:aws-java-sdk-bundle:1.12.262"
-            )
+            "spark.jars.packages",
+            ",".join([
+                "org.apache.hadoop:hadoop-aws:3.4.1",
+                "com.amazonaws:aws-java-sdk-bundle:1.12.262",
+                "io.delta:delta-spark_2.13:4.2.0"
+            ])
+         )
+            
+            .config("spark.sql.extensions", "io.delta.sql.DeltaSparkSessionExtension")
+            .config("spark.sql.catalog.spark_catalog", "org.apache.spark.sql.delta.catalog.DeltaCatalog")
             .config("spark.hadoop.fs.s3a.impl", "org.apache.hadoop.fs.s3a.S3AFileSystem")
             .config(
                 "spark.hadoop.fs.s3a.aws.credentials.provider",

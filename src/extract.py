@@ -14,14 +14,15 @@ load_dotenv()
 S3_BUCKET = os.getenv("S3_BUCKET")        
 AWS_REGION = os.getenv("AWS_REGION")
 GITHUB_TOKEN = os.getenv("GITHUB_TOKEN")
-S3_PREFIX = os.getenv("S3_PREFIX")
-REPO_JSON_PATH = os.getenv("REPO_JSON_PATH")
-if not REPO_JSON_PATH:
-    REPO_JSON_PATH = os.path.join(
-            os.path.dirname(__file__),
-            "repos.json"
-        )
+BRONZE_PREFIX = os.getenv("BRONZE_PREFIX")
 
+REPO_JSON_PATH = os.path.join(
+        os.path.dirname(__file__),
+        "repos.json"
+    )
+
+if not all([S3_BUCKET, AWS_REGION, GITHUB_TOKEN, BRONZE_PREFIX]):
+    raise ValueError("Missing required environment variables.")
 
 s3 = boto3.client("s3", region_name=AWS_REGION)
 
@@ -45,7 +46,7 @@ def s3_checkpoint_read(owner: str, repo: str, endpoint: str) -> Optional[str]:
     """
     Read checkpoint (ISO timestamp) from S3. Returns ISO string or None.
     """
-    key = f"{S3_PREFIX}/checkpoints/{owner}/{repo}/{endpoint}.json"
+    key = f"{BRONZE_PREFIX}/checkpoints/{owner}/{repo}/{endpoint}.json"
     try:
         res = s3.get_object(Bucket=S3_BUCKET, Key=key)
         body = res["Body"].read().decode("utf-8")
@@ -60,14 +61,24 @@ def s3_checkpoint_read(owner: str, repo: str, endpoint: str) -> Optional[str]:
 
 
 def s3_checkpoint_write(owner: str, repo: str, endpoint: str, iso_ts: str) -> None:
-    key = f"{S3_PREFIX}/checkpoints/{owner}/{repo}/{endpoint}.json"
+    key = f"{BRONZE_PREFIX}/checkpoints/{owner}/{repo}/{endpoint}.json"
     payload = {"last_run": iso_ts}
     s3.put_object(Bucket=S3_BUCKET, Key=key, Body=json.dumps(payload).encode("utf-8"))
 
-def s3_repo_metadata_write(owner: str, repo: str, data: dict) -> None:
-    key = f"{S3_PREFIX}/repo_metadata/{owner}/{repo}.json"
-    s3.put_object(Bucket=S3_BUCKET, Key=key, Body=json.dumps(data).encode("utf-8"))
+def s3_repo_metadata_write(owner: str, repo: str, data: dict, now: datetime) -> None:
+    key = (
+        f"{BRONZE_PREFIX}/repo_metadata/{owner}/{repo}/"
+        f"yyyy={now.year:04d}/mm={now.month:02d}/dd={now.day:02d}/"
+        f"hh={now.hour:02d}/repo_metadata_{uuid.uuid4()}.json"
+    )
 
+    s3.put_object(
+        Bucket=S3_BUCKET,
+        Key=key,
+        Body=json.dumps(data).encode("utf-8")
+    )
+
+    print(f"Uploaded repo metadata to s3://{S3_BUCKET}/{key}")
 
 
 
@@ -151,7 +162,7 @@ def fetch_page_and_upload(owner: str, repo: str, endpoint: str, page: Optional[i
     }
 
     key = (
-        f"{S3_PREFIX}/raw_{owner}_{repo}_{endpoint}/"
+        f"{BRONZE_PREFIX}/raw_{owner}_{repo}_{endpoint}/"
         f"yyyy={now.year:04d}/mm={now.month:02d}/dd={now.day:02d}/"
         f"hh={now.hour:02d}/{endpoint}_page_{page}_{uuid.uuid4()}.json"
     )
@@ -295,17 +306,18 @@ def load_repos(filepath: str) -> list[dict]:
     with open(filepath, "r") as f:
         return json.load(f)
     
+
 def upload_repo_metadata(owner: str, repo: str) -> None:
     response = safe_request(f"https://api.github.com/repos/{owner}/{repo}", headers=get_headers())
+    now = datetime.now(timezone.utc)
     payload = {
         "owner": owner,
         "repo": repo,
-        "fetched_at": datetime.now(timezone.utc).isoformat(),
+        "fetched_at": now.isoformat(),
         "endpoint": "repo_metadata",
         "data": response.json()
     }
-    s3_repo_metadata_write(owner, repo, payload)
-
+    s3_repo_metadata_write(owner, repo, payload, now)
 
 def main():
     
@@ -321,8 +333,8 @@ def main():
 
         print(f"Processing {owner}/{repo}...")
         upload_repo_metadata(owner, repo)
-        fetch_paginated_and_upload_sequential(owner, repo, endpoint="issues", incremental=False)
-        fetch_paginated_and_upload_parallel(owner, repo, endpoint="commits", incremental=False)       
+        #fetch_paginated_and_upload_sequential(owner, repo, endpoint="issues", incremental=False)
+        #fetch_paginated_and_upload_parallel(owner, repo, endpoint="commits", incremental=False)       
 
 
 def testing() -> dict: 
