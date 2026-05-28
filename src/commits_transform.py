@@ -218,11 +218,11 @@ def transform_commits(bronze_df, run_ts):
 # .dropDuplicates(["repo_full_name", "commit_id"])
 # just this u cannot choose which row to keep, thus below 
 
-# here we also include snapshot_date in deduping coz there can be updates to the same commit over time 
+# one unique row for each commits are they are mostly immutable. 
 def dedupe_commits(df):
     window_spec = (
         Window
-        .partitionBy("repo_full_name", "commit_id","snapshot_date")
+        .partitionBy("repo_full_name", "commit_id")
         .orderBy(F.col("bronze_ingested_at").desc())
     )
 
@@ -235,27 +235,18 @@ def dedupe_commits(df):
 
 
 
-
 def enrich_with_repo_id(commits_df, repo_metadata_df):
     repo_lookup_df = (
         repo_metadata_df
-        .select(
-            F.col("repo_id"),
-            F.col("repo_full_name"),
-            F.col("snapshot_date")
-        )
-        .dropDuplicates(["repo_full_name", "snapshot_date"])
-    # in silver metadata table, there shouldn't be any dupes but this is just a nice measure 
+        .select("repo_id", "repo_full_name")
+        .dropDuplicates(["repo_full_name"])
     )
 
-    enriched_df = (
+    return (
         commits_df.alias("c")
         .join(
             repo_lookup_df.alias("r"),
-            on=[
-                F.col("c.repo_full_name") == F.col("r.repo_full_name"),
-                F.col("c.snapshot_date") == F.col("r.snapshot_date"),
-            ],
+            on=F.col("c.repo_full_name") == F.col("r.repo_full_name"),
             how="left"
         )
         .select(
@@ -263,9 +254,6 @@ def enrich_with_repo_id(commits_df, repo_metadata_df):
             F.col("r.repo_id")
         )
     )
-
-    return enriched_df
-
 
 def run_data_quality_checks(df, job_run_id):
     silver_row_count = df.count()
