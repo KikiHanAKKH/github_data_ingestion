@@ -2,6 +2,7 @@ from datetime import datetime, timezone
 import os
 import logging
 import uuid
+import argparse
 
 import pyspark.sql.functions as F
 from pyspark.sql import SparkSession
@@ -10,6 +11,7 @@ from pyspark.sql.types import (
     StructType, StructField, StringType, LongType, BooleanType,
     ArrayType
 )
+from delta.tables import DeltaTable
 
 from dotenv import load_dotenv
 
@@ -19,19 +21,50 @@ if os.getenv("ENV", "dev") != "prod":
 
 
 S3_BUCKET = os.getenv("S3_BUCKET")
-AWS_REGION = os.getenv("AWS_REGION")
 BRONZE_PREFIX = os.getenv("BRONZE_PREFIX")
 SILVER_PREFIX = os.getenv("SILVER_PREFIX")
 
-if not all([S3_BUCKET, AWS_REGION, BRONZE_PREFIX, SILVER_PREFIX]):
+if not all([S3_BUCKET, BRONZE_PREFIX, SILVER_PREFIX]):
     raise ValueError("Missing required environment variables.")
 
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
+from datetime import datetime
 
-bronze_path = f"s3a://{S3_BUCKET}/{BRONZE_PREFIX}/raw_apache_airflow_issues/yyyy=2026/mm=03/dd=30/"
+
+def build_bronze_path(
+    process_date: str,
+    owner: str | None = None,
+    repo: str | None = None,
+) -> str:
+    dt = datetime.strptime(process_date, "%Y-%m-%d")
+
+    date_path = (
+        f"yyyy={dt.year}/"
+        f"mm={dt.month:02d}/"
+        f"dd={dt.day:02d}/"
+    )
+
+    if owner and repo:
+        # One specific repo for one date
+        return (
+            f"s3a://{S3_BUCKET}/{BRONZE_PREFIX}/issues/"
+            f"{owner}/{repo}/{date_path}"
+        )
+
+    if owner or repo:
+        raise ValueError("Provide both --owner and --repo, or neither.")
+
+    # All owners and repos for one date
+    return (
+        f"s3a://{S3_BUCKET}/{BRONZE_PREFIX}/issues/"
+        f"*/*/{date_path}"
+    )
+
+
+# bronze_path = f"s3a://{S3_BUCKET}/{BRONZE_PREFIX}/raw_apache_airflow_issues/yyyy=2026/mm=03/dd=30/"
 repo_metadata_silver_path = f"s3a://{S3_BUCKET}/{SILVER_PREFIX}/repo_metadata/"
 issues_silver_path = f"s3a://{S3_BUCKET}/{SILVER_PREFIX}/issues/"
 pulls_silver_path = f"s3a://{S3_BUCKET}/{SILVER_PREFIX}/pulls/"
@@ -41,6 +74,7 @@ bronze_issues_schema = StructType([
     StructField("owner", StringType(), True),
     StructField("repo", StringType(), True),
     StructField("fetched_at", StringType(), True),
+    StructField("batch_timestamp", StringType(), True),
     StructField("endpoint", StringType(), True),
 
     StructField("params", StructType([
@@ -111,30 +145,17 @@ bronze_issues_schema = StructType([
 
 
 def create_spark_session():
+    # JAR packages and S3A/Delta config are supplied by spark-submit
+    # (see dags/github_transform_dag.py's SPARK_PACKAGES/SPARK_CONF) —
+    # nothing to configure here, just attach to the already-configured session.
     return (
         SparkSession.builder
         .appName("issues_prs_transform")
-        .config(
-            "spark.jars.packages",
-            ",".join([
-                "org.apache.hadoop:hadoop-aws:3.4.1",
-                "com.amazonaws:aws-java-sdk-bundle:1.12.262",
-                "io.delta:delta-spark_4.1_2.13:4.1.0"
-            ])
-        )
-        .config("spark.hadoop.fs.s3a.impl", "org.apache.hadoop.fs.s3a.S3AFileSystem")
-        .config(
-            "spark.hadoop.fs.s3a.aws.credentials.provider",
-            "com.amazonaws.auth.DefaultAWSCredentialsProviderChain"
-        )
-        .config("spark.sql.extensions", "io.delta.sql.DeltaSparkSessionExtension")
-        .config("spark.sql.catalog.spark_catalog", "org.apache.spark.sql.delta.catalog.DeltaCatalog")
-        
         .getOrCreate()
     )
 
-
-def read_bronze_data(spark):
+def read_bronze_data(spark, process_date, owner: str | None = None, repo: str | None = None,):
+    bronze_path = build_bronze_path(process_date, owner, repo)
     logger.info(f"Reading bronze issues data from {bronze_path}")
     return (
         spark.read
@@ -155,6 +176,7 @@ def transform_issues_and_prs(bronze_df, run_ts):
         .withColumn("issue_record", F.explode("data"))
         .select(
             F.to_timestamp("fetched_at").alias("bronze_ingested_at"),
+            F.to_timestamp("batch_timestamp").alias("bronze_batch_timestamp"),
             F.col("fetched_at"),
             F.concat_ws("/", F.col("owner"), F.col("repo")).alias("repo_full_name"),
 
@@ -190,7 +212,7 @@ def transform_issues_and_prs(bronze_df, run_ts):
             F.col("issue_record.reactions.total_count").cast("long").alias("reactions_total_count"),
         )
         .withColumn("silver_ingested_at", F.lit(run_ts).cast("timestamp"))
-        .withColumn("snapshot_date", F.to_date("bronze_ingested_at"))
+        .withColumn("snapshot_date", F.to_date("bronze_batch_timestamp"))
     )
 
     issues_df = base_df.filter(~F.col("is_pull_request"))
@@ -224,22 +246,37 @@ def dedupe_issue_like_df(df, id_col):
     )
 
 
-def enrich_with_repo_id(df, repo_metadata_df):
+def enrich_with_repo_id(commits_df, repo_metadata_df):
+    window_spec = (
+        Window
+        .partitionBy("repo_full_name")
+        .orderBy(F.col("snapshot_date").desc())
+    )
+
     repo_lookup_df = (
         repo_metadata_df
-        .select("repo_id", "repo_full_name")
-        .dropDuplicates(["repo_full_name"])
+        .select(
+            "repo_id",
+            "repo_full_name",
+            "snapshot_date"
+        )
+        .withColumn(
+            "rn",
+            F.row_number().over(window_spec)
+        )
+        .filter(F.col("rn") == 1)
+        .drop("rn", "snapshot_date")
     )
 
     return (
-        df.alias("x")
+        commits_df.alias("c")
         .join(
             repo_lookup_df.alias("r"),
-            on=F.col("x.repo_full_name") == F.col("r.repo_full_name"),
+            on=F.col("c.repo_full_name") == F.col("r.repo_full_name"),
             how="left"
         )
         .select(
-            F.col("x.*"),
+            F.col("c.*"),
             F.col("r.repo_id")
         )
     )
@@ -284,7 +321,35 @@ def run_data_quality_checks(df, job_run_id, table_name, id_col):
     return row_count
 
 
-def write_delta(df, path, table_name, process_date):
+
+
+def write_silver_data(spark, source_df, path, id_col):
+    if not DeltaTable.isDeltaTable(spark, path):
+        (
+            source_df.write
+            .format("delta")
+            .save(path)
+        )
+        return
+
+    target = DeltaTable.forPath(spark, path)
+
+    (
+        target.alias("target")
+        .merge(
+            source_df.alias("source"),
+            f"""
+            target.repo_full_name = source.repo_full_name
+            AND target.{id_col} = source.{id_col}
+            """
+        )
+        .whenMatchedUpdateAll()
+        .whenNotMatchedInsertAll()
+        .execute()
+    )
+
+'''
+def write_silver_data(df, path, table_name, process_date):
     logger.info(f"Writing {table_name} silver data to {path}")
 
     (
@@ -296,8 +361,67 @@ def write_delta(df, path, table_name, process_date):
         .save(path)
     )
 
+from delta.tables import DeltaTable
+
+
+def merge_silver_data(
+    spark,
+    df,
+    path,
+    table_name,
+    id_col,
+):
+    logger.info(f"Merging {table_name} silver data into {path}")
+
+    # First-ever run: Delta table does not exist yet
+    if not DeltaTable.isDeltaTable(spark, path):
+        logger.info(
+            f"{table_name} Delta table does not exist yet. "
+            "Creating initial table."
+        )
+
+        (
+            df.write
+            .format("delta")
+            .mode("overwrite")
+            .save(path)
+        )
+
+        return
+
+    # Table already exists
+    delta_table = DeltaTable.forPath(spark, path)
+
+    (
+        delta_table.alias("target")
+        .merge(
+            df.alias("source"),
+            f"""
+            target.repo_id = source.repo_id
+            AND target.{id_col} = source.{id_col}
+            """
+        )
+        .whenMatchedUpdateAll()
+        .whenNotMatchedInsertAll()
+        .execute()
+    )
+
+    logger.info(f"{table_name} Delta merge completed.")
+'''
 
 def main():
+    parser = argparse.ArgumentParser()
+
+    parser.add_argument("--process-date", required=True)
+    parser.add_argument("--owner")
+    parser.add_argument("--repo")
+
+    args = parser.parse_args()
+
+    process_date = args.process_date
+    owner = args.owner
+    repo = args.repo
+
     spark = None
     job_run_id = str(uuid.uuid4())
     job_start_time = datetime.now(timezone.utc)
@@ -309,17 +433,16 @@ def main():
 
     try:
         spark = create_spark_session()
-        spark.conf.set("spark.sql.sources.partitionOverwriteMode", "dynamic")
 
-        bronze_df = read_bronze_data(spark)
+        bronze_df = read_bronze_data(spark, process_date,owner, repo)
         repo_metadata_df = read_repo_metadata_silver(spark)
 
         bronze_row_count = bronze_df.count()
         logger.info(f"job_run_id={job_run_id} bronze_row_count={bronze_row_count}")
 
-        run_ts = spark.sql("SELECT current_timestamp() AS ts").collect()[0]["ts"]
-
-        issues_df, pulls_df = transform_issues_and_prs(bronze_df, run_ts)
+        # run_ts = spark.sql("SELECT current_timestamp() AS ts").collect()[0]["ts"]
+        
+        issues_df, pulls_df = transform_issues_and_prs(bronze_df, job_start_time)
 
         issues_df = dedupe_issue_like_df(issues_df, "issue_id")
         pulls_df = rename_pull_columns(pulls_df)
@@ -335,8 +458,8 @@ def main():
             pulls_df, job_run_id, "pulls", "pull_id"
         )
 
-        write_delta(issues_df, issues_silver_path, "issues")
-        write_delta(pulls_df, pulls_silver_path, "pulls")
+        write_silver_data(spark, issues_df, issues_silver_path, "issue_id")
+        write_silver_data(spark, pulls_df, pulls_silver_path, "pull_id")
 
         job_end_time = datetime.now(timezone.utc)
 

@@ -2,6 +2,7 @@ import os
 import logging
 import pyspark.sql.functions as F
 import uuid
+import argparse
 from datetime import datetime, timezone
 from dotenv import load_dotenv
 from pyspark.sql import SparkSession
@@ -18,6 +19,7 @@ bronze_repo_metadata_schema = StructType([
     StructField("owner", StringType(), True),
     StructField("repo", StringType(), True),
     StructField("fetched_at", StringType(), True),
+    StructField("batch_timestamp", StringType(), True),
     StructField("endpoint", StringType(), True),
 
     StructField("data", StructType([
@@ -189,10 +191,38 @@ if not all([S3_BUCKET, BRONZE_PREFIX, SILVER_PREFIX]):
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
+def build_bronze_path(
+    process_date: str,
+    owner: str | None = None,
+    repo: str | None = None,
+) -> str:
+    dt = datetime.strptime(process_date, "%Y-%m-%d")
+
+    date_path = (
+        f"yyyy={dt.year}/"
+        f"mm={dt.month:02d}/"
+        f"dd={dt.day:02d}/"
+    )
+
+    if owner and repo:
+        # One specific repo for one date
+        return (
+            f"s3a://{S3_BUCKET}/{BRONZE_PREFIX}/repo_metadata/"
+            f"{owner}/{repo}/{date_path}"
+        )
+
+    if owner or repo:
+        raise ValueError("Provide both --owner and --repo, or neither.")
+
+    # All owners and repos for one date
+    return (
+        f"s3a://{S3_BUCKET}/{BRONZE_PREFIX}/repo_metadata/"
+        f"*/*/{date_path}"
+    )
 
 # s3a is the spark connector for s3, make sure hadoop-aws and aws-java-sdk dependencies are included in your Spark setup
 # bronze path is partitioned by date eg: .../repo_metadata/apache/airflow/yyyy=2026/mm=04/dd=06/sthsthsthsthsth.json
-bronze_path = f"s3a://{S3_BUCKET}/{BRONZE_PREFIX}/repo_metadata/*/*/yyyy=2026/mm=04/dd=06/" # with wildcards characters
+# bronze_path = f"s3a://{S3_BUCKET}/{BRONZE_PREFIX}/repo_metadata/*/*/yyyy=2026/mm=04/dd=06/" # with wildcards characters
 silver_path = f"s3a://{S3_BUCKET}/{SILVER_PREFIX}/repo_metadata/"
 
 '''
@@ -220,7 +250,8 @@ bronze_path = (
 
 # if we used year=2026/month=04/day=06/hour=12
 # sprak auto-parses these as columns
-def read_bronze_data(spark):
+def read_bronze_data(spark, process_date, owner: str | None = None, repo: str | None = None):
+    bronze_path = build_bronze_path(process_date, owner, repo)
     # read bronze data with explicit schema for stability
     logger.info(f"Reading bronze data from {bronze_path}")
     # recurisve mode disables inferring yyyy,mm,dd as partition columns
@@ -258,10 +289,11 @@ def transform_repo_metadata(bronze_df, run_ts):
             F.col("data.stargazers_count").cast("long").alias("stargazers_count"),
             F.col("data.subscribers_count").cast("long").alias("subscribers_count"),
 
-            F.to_timestamp("fetched_at").alias("bronze_ingested_at")
+            F.to_timestamp("fetched_at").alias("bronze_ingested_at"),
+            F.to_timestamp("batch_timestamp").alias("bronze_batch_timestamp")
         )
         .withColumn("silver_ingested_at", F.lit(run_ts).cast("timestamp"))
-        .withColumn("snapshot_date", F.to_date("bronze_ingested_at"))
+        .withColumn("snapshot_date", F.to_date("bronze_batch_timestamp"))
 
     )
 
@@ -282,13 +314,22 @@ def dedupe(df):
     )
     return deduped_df
     
-def write_silver_data(df):
-    # overwrite by snapshot date if run multiple times a day 
+def write_silver_data(df, process_date, owner: str | None = None, repo: str | None = None):
+    # overwrite by snapshot date if run multiple times a day
     logger.info(f"Writing silver data to {silver_path}")
+
+    if owner and repo:
+        # Scoped run: only replace this repo's row within the date partition,
+        # so other repos' rows for the same snapshot_date aren't wiped out.
+        repo_full_name = f"{owner}/{repo}"
+        replace_where = f"snapshot_date = '{process_date}' AND repo_full_name = '{repo_full_name}'"
+    else:
+        replace_where = f"snapshot_date = '{process_date}'"
 
     (
         df.write
         .mode("overwrite")
+        .option("replaceWhere", replace_where)
         .partitionBy("snapshot_date")
         .format("delta")
         .save(silver_path)
@@ -335,53 +376,47 @@ def run_data_quality_checks(df, job_run_id):
 
     return silver_row_count
 
-def main(): 
+def main():
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--process-date", required=True)
+    parser.add_argument("--owner")
+    parser.add_argument("--repo")
+    args = parser.parse_args()
+    process_date = args.process_date
+    owner = args.owner
+    repo = args.repo
+
     spark = None
     job_run_id = str(uuid.uuid4())
     job_start_time = datetime.now(timezone.utc)
     job_status = "STARTED"
     logger.info(f"job_run_id={job_run_id} status={job_status} start_time={job_start_time.isoformat()}")
     try:
-        # spark = SparkSession.builder.appName("repo_metadata_transform").getOrCreate()
+        # JAR packages and S3A/Delta config are supplied by spark-submit
+        # (see dags/github_transform_dag.py's SPARK_PACKAGES/SPARK_CONF) —
+        # nothing to configure here, just attach to the already-configured session.
         spark = (
             SparkSession.builder
             .appName("repo_metadata_transform")
-            .config(
-            "spark.jars.packages",
-            ",".join([
-                "org.apache.hadoop:hadoop-aws:3.4.1",
-                "com.amazonaws:aws-java-sdk-bundle:1.12.262",
-                "io.delta:delta-spark_2.13:4.2.0"
-            ])
-         )
-            
-            .config("spark.sql.extensions", "io.delta.sql.DeltaSparkSessionExtension")
-            .config("spark.sql.catalog.spark_catalog", "org.apache.spark.sql.delta.catalog.DeltaCatalog")
-            .config("spark.hadoop.fs.s3a.impl", "org.apache.hadoop.fs.s3a.S3AFileSystem")
-            .config(
-                "spark.hadoop.fs.s3a.aws.credentials.provider",
-                "com.amazonaws.auth.DefaultAWSCredentialsProviderChain"
-            )
             .getOrCreate()
         )
-        spark.conf.set("spark.sql.sources.partitionOverwriteMode", "dynamic")
 
-        bronze_df = read_bronze_data(spark)
+        bronze_df = read_bronze_data(spark, process_date, owner, repo)
 
         # log bronze row count for monitoring
         bronze_row_count = bronze_df.count()
         logger.info(f"job_run_id={job_run_id} bronze_row_count={bronze_row_count}")
 
         # timestamp for silver run 
-        run_ts = spark.sql("SELECT current_timestamp() AS ts").collect()[0]["ts"]
+        # run_ts = spark.sql("SELECT current_timestamp() AS ts").collect()[0]["ts"]
 
-        silver_repo_metadata_df = transform_repo_metadata(bronze_df, run_ts)
+        silver_repo_metadata_df = transform_repo_metadata(bronze_df, job_start_time)
 
         silver_repo_metadata_df_deduped = dedupe(silver_repo_metadata_df)
 
         silver_row_count = run_data_quality_checks(silver_repo_metadata_df_deduped, job_run_id)
 
-        write_silver_data(silver_repo_metadata_df_deduped)
+        write_silver_data(silver_repo_metadata_df_deduped, process_date, owner, repo)
 
         job_end_time = datetime.now(timezone.utc)
         job_status = "SUCCESS"

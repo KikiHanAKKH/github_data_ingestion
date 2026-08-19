@@ -60,9 +60,9 @@ def s3_checkpoint_read(owner: str, repo: str, endpoint: str) -> Optional[str]:
 
 
 
-def s3_checkpoint_write(owner: str, repo: str, endpoint: str, iso_ts: str) -> None:
+def s3_checkpoint_write(owner: str, repo: str, endpoint: str, iso_ts: datetime) -> None:
     key = f"{BRONZE_PREFIX}/checkpoints/{owner}/{repo}/{endpoint}.json"
-    payload = {"last_run": iso_ts}
+    payload = {"last_run": iso_ts.isoformat()}
     s3.put_object(Bucket=S3_BUCKET, Key=key, Body=json.dumps(payload).encode("utf-8"))
 
 def s3_repo_metadata_write(owner: str, repo: str, data: dict, now: datetime) -> None:
@@ -118,7 +118,7 @@ def safe_request(url: str, headers: dict, params=None, retries=3):
                 raise
 
 
-def fetch_page_and_upload(owner: str, repo: str, endpoint: str, page: Optional[int] = None, next_url: Optional[str] = None, params: dict = None, incremental: bool = True,since_value: Optional[str] = None) -> dict:
+def fetch_page_and_upload(owner: str, repo: str, endpoint: str, page: Optional[int] = None, next_url: Optional[str] = None, params: dict = None, incremental: bool = True,since_value: Optional[str] = None, until_value: Optional[str] = None, run_timestamp: datetime = None) -> dict:
     """
     Fetch one page from GitHub and upload it to S3.
 
@@ -138,7 +138,9 @@ def fetch_page_and_upload(owner: str, repo: str, endpoint: str, page: Optional[i
         params.setdefault("state", "all")
     if since_value and "since" not in params:
         params["since"] = since_value
-    
+    if until_value and "until" not in params:
+        params["until"] = until_value
+
     if not next_url:
         url = f"https://api.github.com/repos/{owner}/{repo}/{endpoint}"
         response = safe_request(url, headers=get_headers(), params=params)
@@ -146,8 +148,8 @@ def fetch_page_and_upload(owner: str, repo: str, endpoint: str, page: Optional[i
         url = next_url
         response = safe_request(url, headers=get_headers(), params=None)
 
-    now = datetime.now(timezone.utc)
-    fetched_at = now.isoformat()
+    
+    fetched_at = datetime.now(timezone.utc).isoformat()
     data = response.json()
 
     payload = {
@@ -159,12 +161,13 @@ def fetch_page_and_upload(owner: str, repo: str, endpoint: str, page: Optional[i
         "url": response.url,
         "count": len(data),
         "data": data,
+        "batch_timestamp": run_timestamp.isoformat() 
     }
 
     key = (
-        f"{BRONZE_PREFIX}/raw_{owner}_{repo}_{endpoint}/"
-        f"yyyy={now.year:04d}/mm={now.month:02d}/dd={now.day:02d}/"
-        f"hh={now.hour:02d}/{endpoint}_page_{page}_{uuid.uuid4()}.json"
+        f"{BRONZE_PREFIX}/{endpoint}/{owner}/{repo}/"
+        f"yyyy={run_timestamp.year:04d}/mm={run_timestamp.month:02d}/dd={run_timestamp.day:02d}/"
+        f"hh={run_timestamp.hour:02d}/{endpoint}_page_{page}_{uuid.uuid4()}.json"
     )
 
     upload_to_s3(json.dumps(payload).encode("utf-8"), key)
@@ -181,10 +184,13 @@ def fetch_page_and_upload(owner: str, repo: str, endpoint: str, page: Optional[i
 
 
 
-def fetch_paginated_and_upload_sequential(owner: str, repo: str, endpoint: str, params: dict = None, incremental: bool = True) -> None:
+def fetch_paginated_and_upload_sequential(owner: str, repo: str, endpoint: str, params: dict = None, incremental: bool = True, run_timestamp: datetime = None, since_override: Optional[str] = None, until_override: Optional[str] = None) -> None:
     page = 1
     total_items = 0
-    since_value = s3_checkpoint_read(owner, repo, endpoint) if incremental else None
+    if since_override is not None:
+        since_value = since_override
+    else:
+        since_value = s3_checkpoint_read(owner, repo, endpoint) if incremental else None
     url = None
     while True:
         result = fetch_page_and_upload(
@@ -195,7 +201,9 @@ def fetch_paginated_and_upload_sequential(owner: str, repo: str, endpoint: str, 
             next_url=url,
             params=params,
             incremental=incremental,
-            since_value=since_value
+            since_value=since_value,
+            until_value=until_override,
+            run_timestamp=run_timestamp
         )
 
         total_items += result["count"]
@@ -208,23 +216,23 @@ def fetch_paginated_and_upload_sequential(owner: str, repo: str, endpoint: str, 
         page += 1
 
     finished_at = datetime.now(timezone.utc).isoformat()
-    s3_checkpoint_write(owner, repo, endpoint, finished_at)
-    print(f"Checkpoint for {owner}/{repo} {endpoint} updated to {finished_at}")
-    print(f"Finished sequential fetch for {owner}/{repo} {endpoint}: total_items={total_items}")
+    print(f"Finished sequential fetch for {owner}/{repo} {endpoint}: total_items={total_items} at {finished_at}")
 
 
 
-def get_total_pages(owner: str, repo: str, endpoint: str, params: dict = None,incremental = False, since_value: Optional[str] = None) -> Optional[int]:
+def get_total_pages(owner: str, repo: str, endpoint: str, params: dict = None,incremental = False, since_value: Optional[str] = None, until_value: Optional[str] = None) -> Optional[int]:
     params = params.copy() if params else {}
     params.setdefault("per_page", 100)
     params["page"] = 1
     if endpoint == "issues":
         params.setdefault("state", "all")
-    
 
-    
-    if since_value and incremental and "since" not in params:
+
+
+    if since_value and "since" not in params:
         params["since"] = since_value
+    if until_value and "until" not in params:
+        params["until"] = until_value
 
     url = f"https://api.github.com/repos/{owner}/{repo}/{endpoint}"
     response = safe_request(url, headers=get_headers(), params=params)
@@ -243,15 +251,19 @@ def get_total_pages(owner: str, repo: str, endpoint: str, params: dict = None,in
 
 
 # parallel only works for commits coz issues it doesn't hav a 'last' in its header, so we can't  know how many pages numbers we need to fetch 
-def fetch_paginated_and_upload_parallel(owner: str, repo: str, endpoint: str, params: dict = None, incremental: bool = True, max_workers: int = 8) -> None:
-    since_value = s3_checkpoint_read(owner, repo, endpoint) if incremental else None
+def fetch_paginated_and_upload_parallel(owner: str, repo: str, endpoint: str, params: dict = None, incremental: bool = True, max_workers: int = 8, run_timestamp: datetime = None, since_override: Optional[str] = None, until_override: Optional[str] = None) -> None:
+    if since_override is not None:
+        since_value = since_override
+    else:
+        since_value = s3_checkpoint_read(owner, repo, endpoint) if incremental else None
     total_pages = get_total_pages(
         owner=owner,
         repo=repo,
         endpoint=endpoint,
         params=params,
         incremental=incremental,
-        since_value = since_value
+        since_value=since_value,
+        until_value=until_override,
     )
 
     print(f"{owner}/{repo} {endpoint}: total_pages={total_pages}")
@@ -259,11 +271,11 @@ def fetch_paginated_and_upload_parallel(owner: str, repo: str, endpoint: str, pa
     if total_pages == 0:
         print(f"No data found for {owner}/{repo} {endpoint}")
         return
-    
+
     if total_pages is None:
         print(f"Cannot determine total pages for {owner}/{repo} {endpoint}, falling back to sequential fetch")
-        fetch_paginated_and_upload_sequential(owner, repo, endpoint, params, incremental)
-        return 
+        fetch_paginated_and_upload_sequential(owner, repo, endpoint, params, incremental, run_timestamp, since_override, until_override)
+        return
 
     completed_pages = 0
     total_items = 0
@@ -271,7 +283,7 @@ def fetch_paginated_and_upload_parallel(owner: str, repo: str, endpoint: str, pa
 
     with ThreadPoolExecutor(max_workers=max_workers) as executor:
         futures = {
-            executor.submit(fetch_page_and_upload, owner=owner, repo=repo, endpoint=endpoint, page=page, params=params, incremental=incremental, since_value=since_value): page
+            executor.submit(fetch_page_and_upload, owner=owner, repo=repo, endpoint=endpoint, page=page, params=params, incremental=incremental, since_value=since_value, until_value=until_override, run_timestamp=run_timestamp): page
             for page in range(1, total_pages + 1)
         }
 
@@ -297,9 +309,7 @@ def fetch_paginated_and_upload_parallel(owner: str, repo: str, endpoint: str, pa
                 raise
 
     finished_at = datetime.now(timezone.utc).isoformat()
-    s3_checkpoint_write(owner, repo, endpoint, finished_at)
-    print(f"Checkpoint for {endpoint} updated to {finished_at}")
-    print(f"Finished parallel fetch for {owner}/{repo} {endpoint}: total_items={total_items}")
+    print(f"Finished parallel fetch for {owner}/{repo} {endpoint}: total_items={total_items} at {finished_at}")
 
 
 def load_repos(filepath: str) -> list[dict]:
@@ -307,17 +317,18 @@ def load_repos(filepath: str) -> list[dict]:
         return json.load(f)
     
 
-def upload_repo_metadata(owner: str, repo: str) -> None:
+def upload_repo_metadata(owner: str, repo: str, run_timestamp: datetime) -> None:
     response = safe_request(f"https://api.github.com/repos/{owner}/{repo}", headers=get_headers())
     now = datetime.now(timezone.utc)
     payload = {
         "owner": owner,
         "repo": repo,
         "fetched_at": now.isoformat(),
+        "batch_timestamp": run_timestamp.isoformat(),
         "endpoint": "repo_metadata",
         "data": response.json()
     }
-    s3_repo_metadata_write(owner, repo, payload, now)
+    s3_repo_metadata_write(owner, repo, payload, run_timestamp)
 
 def main():
     
@@ -326,15 +337,27 @@ def main():
     #fetch_paginated_and_upload_sequential("pallets", "flask", endpoint="commits", incremental=False)
     
     repos = load_repos(REPO_JSON_PATH)
+    run_started_at = datetime.now(timezone.utc)
     
+
     for repo_info in repos:
         owner = repo_info["owner"]
         repo = repo_info["repo"]
 
         print(f"Processing {owner}/{repo}...")
-        upload_repo_metadata(owner, repo)
-        #fetch_paginated_and_upload_sequential(owner, repo, endpoint="issues", incremental=False)
-        #fetch_paginated_and_upload_parallel(owner, repo, endpoint="commits", incremental=False)       
+        upload_repo_metadata(owner, repo, run_started_at)
+
+        fetch_paginated_and_upload_sequential(owner, repo, endpoint="issues", incremental=False, run_timestamp=run_started_at)
+        s3_checkpoint_write(owner, repo, endpoint="issues", iso_ts=run_started_at)
+        print(f"Checkpoint for {owner}/{repo} issues updated to {run_started_at}")
+
+        fetch_paginated_and_upload_parallel(owner, repo, endpoint="commits", incremental=False, run_timestamp=run_started_at)    
+        s3_checkpoint_write(owner, repo, endpoint="commits", iso_ts=run_started_at)
+        print(f"Checkpoint for {owner}/{repo} commits updated to {run_started_at}") 
+
+    run_finished_at = datetime.now(timezone.utc)
+    print(f"All repos processed. Run started at {run_started_at}, finished at {run_finished_at}") 
+        
 
 
 def testing() -> dict: 
