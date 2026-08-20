@@ -10,7 +10,7 @@ RUN apt-get update && \
     && rm -rf /var/lib/apt/lists/*
 
 # Install Spark
-ENV SPARK_VERSION=4.1.2
+ENV SPARK_VERSION=4.0.4
 ENV SPARK_HOME=/opt/spark
 
 RUN curl -L \
@@ -26,6 +26,10 @@ ENV PATH="${SPARK_HOME}/bin:${PATH}"
 USER airflow
 
 # Install Airflow's Spark integration
+# pyspark is pinned to match SPARK_VERSION exactly — otherwise pip resolves
+# it to whatever's newest on PyPI, which drifts from the spark-submit binary
+# actually installed above and causes Python/JVM protocol mismatches.
 RUN pip install --no-cache-dir \
     "apache-airflow==3.1.8" \
-    apache-airflow-providers-apache-spark
+    apache-airflow-providers-apache-spark \
+    "pyspark==4.0.4"
