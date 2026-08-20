@@ -11,7 +11,7 @@ SRC_DIR = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__)
 # configures the JVM/classpath before the script even starts.
 SPARK_PACKAGES = ",".join([
     "org.apache.hadoop:hadoop-aws:3.4.1",
-    "io.delta:delta-spark_2.13:4.0.0",
+    "io.delta:delta-spark_2.13:4.0.1",
 ])
 SPARK_CONF = {
     "spark.sql.session.timeZone": "UTC",
