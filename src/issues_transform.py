@@ -7,6 +7,7 @@ import argparse
 import pyspark.sql.functions as F
 from pyspark.sql import SparkSession
 from pyspark.sql.window import Window
+from pyspark import StorageLevel
 from pyspark.sql.types import (
     StructType, StructField, StringType, LongType, BooleanType,
     ArrayType
@@ -450,6 +451,8 @@ def main():
 
         issues_df = enrich_with_repo_id(issues_df, repo_metadata_df)
         pulls_df = enrich_with_repo_id(pulls_df, repo_metadata_df)
+        issues_df.persist(StorageLevel.MEMORY_AND_DISK)
+        pulls_df.persist(StorageLevel.MEMORY_AND_DISK)
 
         issues_count = run_data_quality_checks(
             issues_df, job_run_id, "issues", "issue_id"
@@ -460,6 +463,8 @@ def main():
 
         write_silver_data(spark, issues_df, issues_silver_path, "issue_id")
         write_silver_data(spark, pulls_df, pulls_silver_path, "pull_id")
+        issues_df.unpersist()
+        pulls_df.unpersist()
 
         job_end_time = datetime.now(timezone.utc)
 

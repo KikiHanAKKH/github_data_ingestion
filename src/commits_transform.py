@@ -5,6 +5,7 @@ import pyspark.sql.functions as F
 import uuid
 import argparse
 from pyspark.sql.window import Window
+from pyspark import StorageLevel
 from dotenv import load_dotenv
 from pyspark.sql import SparkSession
 from pyspark.sql.functions import (
@@ -447,6 +448,7 @@ def main():
             silver_commits_df_deduped,
             repo_metadata_df
         )
+        silver_commits_df_enriched.persist(StorageLevel.MEMORY_AND_DISK)
 
         silver_row_count = run_data_quality_checks(
             silver_commits_df_enriched,
@@ -454,6 +456,7 @@ def main():
         )
 
         write_silver_data(spark, silver_commits_df_enriched)
+        silver_commits_df_enriched.unpersist()
 
         job_end_time = datetime.now(timezone.utc)
         job_status = "SUCCESS"
