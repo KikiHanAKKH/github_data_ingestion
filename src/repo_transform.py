@@ -7,6 +7,7 @@ from datetime import datetime, timezone
 from dotenv import load_dotenv
 from pyspark.sql import SparkSession
 from pyspark.sql.window import Window
+from pyspark import StorageLevel
 
 from pyspark.sql.types import (
     StructType, StructField, StringType, LongType, BooleanType,
@@ -338,17 +339,42 @@ def write_silver_data(df, process_date, owner: str | None = None, repo: str | No
     # no snapshot_date column in parquet, but when it's read back, snapshot_date will be a column again 
 
 def run_data_quality_checks(df, job_run_id):
-    # check if silver DataFrame is empty
-    silver_row_count = df.count()
+    required_columns = ["repo_id", "repo_full_name", "repo_url", "snapshot_date"]
+
+    # Single scan of df instead of one .count()/.filter().count() per metric.
+    metrics = (
+        df.agg(
+            F.count("*").alias("row_count"),
+
+            *[
+                F.sum(
+                    F.when(F.col(col_name).isNull(), 1).otherwise(0)
+                ).alias(f"{col_name}_null_count")
+                for col_name in required_columns
+            ],
+
+            F.sum(
+                F.when(
+                    (F.col("size_kb") < 0) |
+                    (F.col("network_count") < 0) |
+                    (F.col("open_issues_count") < 0) |
+                    (F.col("stargazers_count") < 0) |
+                    (F.col("subscribers_count") < 0),
+                    1
+                ).otherwise(0)
+            ).alias("negative_metric_row_count"),
+        )
+        .first()
+    )
+
+    silver_row_count = metrics["row_count"]
     logger.info(f"job_run_id={job_run_id} silver_row_count_pre_write={silver_row_count}")
 
     if silver_row_count == 0:
         raise ValueError("Data quality check failed: silver DataFrame is empty.")
 
-    # check critical columns for nulls
-    required_columns = ["repo_id", "repo_full_name", "repo_url", "snapshot_date"]
     for col_name in required_columns:
-        null_count = df.filter(F.col(col_name).isNull()).count()
+        null_count = metrics[f"{col_name}_null_count"]
         logger.info(f"job_run_id={job_run_id} null_count_{col_name}={null_count}")
 
         if null_count > 0:
@@ -356,17 +382,7 @@ def run_data_quality_checks(df, job_run_id):
                 f"Data quality check failed: column {col_name} has {null_count} null values."
             )
 
-    # check numeric metrics for negative values 
-    negative_metric_count = (
-        df.filter(
-            (F.col("size_kb") < 0) |
-            (F.col("network_count") < 0) |
-            (F.col("open_issues_count") < 0) |
-            (F.col("stargazers_count") < 0) |
-            (F.col("subscribers_count") < 0)
-        ).count()
-    )
-
+    negative_metric_count = metrics["negative_metric_row_count"]
     logger.info(f"job_run_id={job_run_id} negative_metric_row_count={negative_metric_count}")
 
     if negative_metric_count > 0:
@@ -413,10 +429,12 @@ def main():
         silver_repo_metadata_df = transform_repo_metadata(bronze_df, job_start_time)
 
         silver_repo_metadata_df_deduped = dedupe(silver_repo_metadata_df)
+        silver_repo_metadata_df_deduped.persist(StorageLevel.MEMORY_AND_DISK)
 
         silver_row_count = run_data_quality_checks(silver_repo_metadata_df_deduped, job_run_id)
 
         write_silver_data(silver_repo_metadata_df_deduped, process_date, owner, repo)
+        silver_repo_metadata_df_deduped.unpersist()
 
         job_end_time = datetime.now(timezone.utc)
         job_status = "SUCCESS"

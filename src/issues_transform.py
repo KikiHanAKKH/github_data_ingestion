@@ -232,7 +232,7 @@ def rename_pull_columns(pulls_df):
     )
 
 
-def dedupe_issue_like_df(df, id_col):
+def dedupe_df(df, id_col):
     window_spec = (
         Window
         .partitionBy("repo_full_name", id_col, "snapshot_date")
@@ -284,17 +284,36 @@ def enrich_with_repo_id(commits_df, repo_metadata_df):
 
 
 def run_data_quality_checks(df, job_run_id, table_name, id_col):
-    row_count = df.count()
+    required_columns = [id_col, "repo_full_name", "html_url", "snapshot_date"]
+
+    # Single scan of df for row count + null counts + missing_repo_id_count.
+    metrics = (
+        df.agg(
+            F.count("*").alias("row_count"),
+
+            *[
+                F.sum(
+                    F.when(F.col(col_name).isNull(), 1).otherwise(0)
+                ).alias(f"{col_name}_null_count")
+                for col_name in required_columns
+            ],
+
+            F.sum(
+                F.when(F.col("repo_id").isNull(), 1).otherwise(0)
+            ).alias("missing_repo_id_count"),
+        )
+        .first()
+    )
+
+    row_count = metrics["row_count"]
     logger.info(f"job_run_id={job_run_id} table={table_name} row_count_pre_write={row_count}")
 
     if row_count == 0:
         logger.warning(f"job_run_id={job_run_id} table={table_name} is empty.")
         return row_count
 
-    required_columns = [id_col, "repo_full_name", "html_url", "snapshot_date"]
-
     for col_name in required_columns:
-        null_count = df.filter(F.col(col_name).isNull()).count()
+        null_count = metrics[f"{col_name}_null_count"]
         logger.info(f"job_run_id={job_run_id} table={table_name} null_count_{col_name}={null_count}")
 
         if null_count > 0:
@@ -302,6 +321,7 @@ def run_data_quality_checks(df, job_run_id, table_name, id_col):
                 f"Data quality failed: table={table_name}, column={col_name}, null_count={null_count}"
             )
 
+    # Duplicate check needs a groupBy, so it stays a separate aggregation.
     duplicate_count = (
         df.groupBy("repo_full_name", id_col, "snapshot_date")
         .count()
@@ -316,7 +336,7 @@ def run_data_quality_checks(df, job_run_id, table_name, id_col):
             f"Data quality failed: table={table_name}, duplicate_groups={duplicate_count}"
         )
 
-    missing_repo_id_count = df.filter(F.col("repo_id").isNull()).count()
+    missing_repo_id_count = metrics["missing_repo_id_count"]
     logger.info(f"job_run_id={job_run_id} table={table_name} missing_repo_id_count={missing_repo_id_count}")
 
     return row_count
@@ -445,9 +465,9 @@ def main():
         
         issues_df, pulls_df = transform_issues_and_prs(bronze_df, job_start_time)
 
-        issues_df = dedupe_issue_like_df(issues_df, "issue_id")
+        issues_df = dedupe_df(issues_df, "issue_id")
         pulls_df = rename_pull_columns(pulls_df)
-        pulls_df = dedupe_issue_like_df(pulls_df, "pull_id")
+        pulls_df = dedupe_df(pulls_df, "pull_id")
 
         issues_df = enrich_with_repo_id(issues_df, repo_metadata_df)
         pulls_df = enrich_with_repo_id(pulls_df, repo_metadata_df)

@@ -313,16 +313,38 @@ def enrich_with_repo_id(commits_df, repo_metadata_df):
     )
 
 def run_data_quality_checks(df, job_run_id):
-    silver_row_count = df.count()
+    required_columns = ["commit_id", "repo_full_name", "url", "snapshot_date"]
+
+    # Single scan of df for row count + null counts + missing_repo_id_count.
+    metrics = (
+        df.agg(
+            F.count("*").alias("row_count"),
+
+            *[
+                F.sum(
+                    F.when(F.col(col_name).isNull(), 1).otherwise(0)
+                ).alias(f"{col_name}_null_count")
+                for col_name in required_columns
+            ],
+
+            F.sum(
+                F.when(F.col("repo_id").isNull(), 1).otherwise(0)
+            ).alias("missing_repo_id_count"),
+        )
+        .first()
+    )
+
+    silver_row_count = metrics["row_count"]
     logger.info(f"job_run_id={job_run_id} silver_row_count_pre_write={silver_row_count}")
 
     if silver_row_count == 0:
-        raise ValueError("Data quality check failed: silver commits DataFrame is empty.")
-
-    required_columns = ["commit_id", "repo_full_name", "url", "snapshot_date"]
+        # No commits in this interval isn't an invalid pipeline state, just no
+        # activity — unlike null/duplicate violations, which are real failures.
+        logger.warning(f"job_run_id={job_run_id} table=commits is empty.")
+        return 0
 
     for col_name in required_columns:
-        null_count = df.filter(F.col(col_name).isNull()).count()
+        null_count = metrics[f"{col_name}_null_count"]
         logger.info(f"job_run_id={job_run_id} null_count_{col_name}={null_count}")
 
         if null_count > 0:
@@ -330,6 +352,7 @@ def run_data_quality_checks(df, job_run_id):
                 f"Data quality check failed: column {col_name} has {null_count} null values."
             )
 
+    # Duplicate check needs a groupBy, so it stays a separate aggregation.
     duplicate_count = (
         df.groupBy("repo_full_name", "commit_id","snapshot_date")
         .count()
@@ -344,7 +367,7 @@ def run_data_quality_checks(df, job_run_id):
             f"Data quality check failed: found {duplicate_count} duplicate commit groups."
         )
 
-    missing_repo_id_count = df.filter(F.col("repo_id").isNull()).count()
+    missing_repo_id_count = metrics["missing_repo_id_count"]
     logger.info(f"job_run_id={job_run_id} missing_repo_id_count={missing_repo_id_count}")
 
     return silver_row_count
@@ -424,10 +447,9 @@ def main():
     spark = None
     job_run_id = str(uuid.uuid4())
     job_start_time = datetime.now(timezone.utc)
-    job_status = "STARTED"
 
     logger.info(
-        f"job_run_id={job_run_id} status={job_status} "
+        f"job_run_id={job_run_id} status=STARTED "
         f"start_time={job_start_time.isoformat()}"
     )
     try:
@@ -438,7 +460,7 @@ def main():
         repo_metadata_df = read_repo_metadata_silver(spark)
 
         bronze_row_count = bronze_df.count()
-        logger.info(f"job_run_id={job_run_id} bronze_file_count={bronze_row_count}")
+        logger.info(f"job_run_id={job_run_id} bronze_row_count={bronze_row_count}")
 
         # run_ts = spark.sql("SELECT current_timestamp() AS ts").collect()[0]["ts"]
 
@@ -465,7 +487,7 @@ def main():
             f"job_run_id={job_run_id} status={job_status} "
             f"start_time={job_start_time.isoformat()} "
             f"end_time={job_end_time.isoformat()} "
-            f"bronze_file_count={bronze_row_count} "
+            f"bronze_row_count={bronze_row_count} "
             f"silver_row_count_written={silver_row_count}"
         )
 
