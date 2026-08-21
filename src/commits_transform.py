@@ -301,7 +301,7 @@ def enrich_with_repo_id(commits_df, repo_metadata_df):
     return (
         commits_df.alias("c")
         .join(
-            repo_lookup_df.alias("r"),
+            F.broadcast(repo_lookup_df).alias("r"),
             on=F.col("c.repo_full_name") == F.col("r.repo_full_name"),
             how="left"
         )
