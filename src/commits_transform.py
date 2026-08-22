@@ -471,6 +471,7 @@ def main():
             repo_metadata_df
         )
         silver_commits_df_enriched.persist(StorageLevel.MEMORY_AND_DISK)
+        # silver_commits_df_enriched.explain("formatted")  # TEMP: remove after checking the plan (broadcast join / caching)
 
         silver_row_count = run_data_quality_checks(
             silver_commits_df_enriched,

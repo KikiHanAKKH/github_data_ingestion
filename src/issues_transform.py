@@ -473,6 +473,8 @@ def main():
         pulls_df = enrich_with_repo_id(pulls_df, repo_metadata_df)
         issues_df.persist(StorageLevel.MEMORY_AND_DISK)
         pulls_df.persist(StorageLevel.MEMORY_AND_DISK)
+        # issues_df.explain("formatted")  # TEMP: remove after checking the plan (broadcast join / caching)
+        # pulls_df.explain("formatted")  # TEMP: remove after checking the plan (broadcast join / caching)
 
         issues_count = run_data_quality_checks(
             issues_df, job_run_id, "issues", "issue_id"

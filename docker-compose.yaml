@@ -180,6 +180,8 @@ services:
   airflow-worker:
     <<: *airflow-common
     command: celery worker
+    ports:
+      - "4040:4040"
     healthcheck:
       # yamllint disable rule:line-length
       test: ["CMD-SHELL", 'celery --app airflow.providers.celery.executors.celery_executor.app inspect ping -d "celery@$${HOSTNAME}" || celery --app airflow.executors.celery_executor.app inspect ping -d "celery@$${HOSTNAME}"']

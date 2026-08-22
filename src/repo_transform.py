@@ -430,6 +430,7 @@ def main():
 
         silver_repo_metadata_df_deduped = dedupe(silver_repo_metadata_df)
         silver_repo_metadata_df_deduped.persist(StorageLevel.MEMORY_AND_DISK)
+        # silver_repo_metadata_df_deduped.explain("formatted")  # TEMP: remove after checking the plan (caching)
 
         silver_row_count = run_data_quality_checks(silver_repo_metadata_df_deduped, job_run_id)
 
