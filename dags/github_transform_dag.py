@@ -21,6 +21,12 @@ SPARK_CONF = {
     "spark.sql.catalog.spark_catalog": "org.apache.spark.sql.delta.catalog.DeltaCatalog",
 }
 
+# 1-slot pool so commits/issues never run their local Spark jobs at the same
+# time (they'd otherwise both grab local[*] cores concurrently). Must exist
+# in Airflow's metadata DB — create once with:
+#   airflow pools set transform_serial_pool 1 "Serializes commits/issues transforms"
+TRANSFORM_SERIAL_POOL = "transform_serial_pool"
+
 
 @dag(
     dag_id="github_silver_transforms",
@@ -75,6 +81,7 @@ def github_silver_transforms():
         packages=SPARK_PACKAGES,
         conf=SPARK_CONF,
         conn_id="spark_default",
+        pool=TRANSFORM_SERIAL_POOL,
     )
 
     transform_issues = SparkSubmitOperator(
@@ -84,6 +91,7 @@ def github_silver_transforms():
         packages=SPARK_PACKAGES,
         conf=SPARK_CONF,
         conn_id="spark_default",
+        pool=TRANSFORM_SERIAL_POOL,
     )
 
     transform_repo_metadata >> [transform_commits, transform_issues]
