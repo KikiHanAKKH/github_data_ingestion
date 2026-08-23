@@ -70,6 +70,12 @@ repo_metadata_silver_path = f"s3a://{S3_BUCKET}/{SILVER_PREFIX}/repo_metadata/"
 issues_silver_path = f"s3a://{S3_BUCKET}/{SILVER_PREFIX}/issues/"
 pulls_silver_path = f"s3a://{S3_BUCKET}/{SILVER_PREFIX}/pulls/"
 
+# SCD2 change-detection columns (post-rename_pull_columns names for pulls).
+# Deliberately excludes high-churn fields (comments_count, body) that would
+# otherwise create a new version on almost every fetch.
+ISSUES_TRACKED_COLUMNS = ["issue_title", "issue_state", "closed_at", "state_reason"]
+PULLS_TRACKED_COLUMNS = ["pull_title", "pull_state", "closed_at", "state_reason", "pull_request_merged_at"]
+
 
 bronze_issues_schema = StructType([
     StructField("owner", StringType(), True),
@@ -213,7 +219,7 @@ def transform_issues_and_prs(bronze_df, run_ts):
             F.col("issue_record.reactions.total_count").cast("long").alias("reactions_total_count"),
         )
         .withColumn("silver_ingested_at", F.lit(run_ts).cast("timestamp"))
-        .withColumn("snapshot_date", F.to_date("bronze_batch_timestamp"))
+        .withColumn("batch_date", F.to_date("bronze_batch_timestamp"))
     )
 
     issues_df = base_df.filter(~F.col("is_pull_request"))
@@ -235,7 +241,7 @@ def rename_pull_columns(pulls_df):
 def dedupe_df(df, id_col):
     window_spec = (
         Window
-        .partitionBy("repo_full_name", id_col, "snapshot_date")
+        .partitionBy("repo_full_name", id_col, "batch_date")
         .orderBy(F.col("bronze_ingested_at").desc())
     )
 
@@ -251,7 +257,7 @@ def enrich_with_repo_id(commits_df, repo_metadata_df):
     window_spec = (
         Window
         .partitionBy("repo_full_name")
-        .orderBy(F.col("snapshot_date").desc())
+        .orderBy(F.col("batch_date").desc())
     )
 
     repo_lookup_df = (
@@ -259,14 +265,14 @@ def enrich_with_repo_id(commits_df, repo_metadata_df):
         .select(
             "repo_id",
             "repo_full_name",
-            "snapshot_date"
+            "batch_date"
         )
         .withColumn(
             "rn",
             F.row_number().over(window_spec)
         )
         .filter(F.col("rn") == 1)
-        .drop("rn", "snapshot_date")
+        .drop("rn", "batch_date")
     )
 
     return (
@@ -284,9 +290,10 @@ def enrich_with_repo_id(commits_df, repo_metadata_df):
 
 
 def run_data_quality_checks(df, job_run_id, table_name, id_col):
-    required_columns = [id_col, "repo_full_name", "html_url", "snapshot_date"]
+    required_columns = [id_col, "repo_id", "repo_full_name", "html_url", "batch_date"]
 
-    # Single scan of df for row count + null counts + missing_repo_id_count.
+    # Single scan of df for row count + null counts (repo_id included, since
+    # it's part of the SCD2 entity key — a null repo_id must be a hard failure).
     metrics = (
         df.agg(
             F.count("*").alias("row_count"),
@@ -297,10 +304,6 @@ def run_data_quality_checks(df, job_run_id, table_name, id_col):
                 ).alias(f"{col_name}_null_count")
                 for col_name in required_columns
             ],
-
-            F.sum(
-                F.when(F.col("repo_id").isNull(), 1).otherwise(0)
-            ).alias("missing_repo_id_count"),
         )
         .first()
     )
@@ -322,8 +325,10 @@ def run_data_quality_checks(df, job_run_id, table_name, id_col):
             )
 
     # Duplicate check needs a groupBy, so it stays a separate aggregation.
+    # Entity key is (repo_id, id_col) — dedupe_df already guarantees at most
+    # one row per entity within a single run's batch, this just validates it.
     duplicate_count = (
-        df.groupBy("repo_full_name", id_col, "snapshot_date")
+        df.groupBy("repo_id", id_col)
         .count()
         .filter(F.col("count") > 1)
         .count()
@@ -336,38 +341,106 @@ def run_data_quality_checks(df, job_run_id, table_name, id_col):
             f"Data quality failed: table={table_name}, duplicate_groups={duplicate_count}"
         )
 
-    missing_repo_id_count = metrics["missing_repo_id_count"]
-    logger.info(f"job_run_id={job_run_id} table={table_name} missing_repo_id_count={missing_repo_id_count}")
-
     return row_count
 
 
 
 
-def write_silver_data(spark, source_df, path, id_col):
+def write_silver_data(spark, source_df, path, id_col, tracked_columns):
+    # SCD2: keep every meaningful historical version instead of overwriting
+    # in place. Versioned by GitHub's own updated_at (not batch_date,
+    # which only reflects when *our pipeline* happened to fetch it), and
+    # only a change in `tracked_columns` creates a new version.
     if not DeltaTable.isDeltaTable(spark, path):
         (
-            source_df.write
+            source_df
+            .withColumn("valid_from", F.col("updated_at"))
+            .withColumn("valid_to", F.lit(None).cast("timestamp"))
+            .withColumn("is_current", F.lit(True))
+            .write
             .format("delta")
             .save(path)
         )
         return
 
     target = DeltaTable.forPath(spark, path)
+    current_df = target.toDF().filter(F.col("is_current"))
+
+    compare_cols = ["repo_id", id_col, "updated_at"] + tracked_columns
+    joined = (
+        source_df.alias("s")
+        .join(
+            current_df.select(*compare_cols).alias("t"),
+            on=[
+                F.col("s.repo_id") == F.col("t.repo_id"),
+                F.col(f"s.{id_col}") == F.col(f"t.{id_col}"),
+            ],
+            how="left",
+        )
+    )
+    joined.persist(StorageLevel.MEMORY_AND_DISK)
+
+    is_new_entity = F.col("t.updated_at").isNull()
+    is_newer = F.col("s.updated_at") > F.col("t.updated_at")
+
+    has_changed = F.lit(False)
+    for col_name in tracked_columns:
+        has_changed = has_changed | ~F.col(f"s.{col_name}").eqNullSafe(F.col(f"t.{col_name}"))
+
+    needs_new_version = is_new_entity | (is_newer & has_changed)
+
+    # Step 1: expire current rows being superseded by a newer, changed
+    # version. A single MERGE can't both update this matched row AND insert
+    # a separate new row from the same source record, so this is a distinct
+    # operation from the insert below.
+    rows_to_expire = (
+        joined
+        .filter(~is_new_entity & is_newer & has_changed)
+        .select(
+            F.col("s.repo_id").alias("repo_id"),
+            F.col(f"s.{id_col}").alias(id_col),
+            F.col("s.updated_at").alias("new_updated_at"),
+        )
+    )
 
     (
         target.alias("target")
         .merge(
-            source_df.alias("source"),
+            rows_to_expire.alias("src"),
             f"""
-            target.repo_full_name = source.repo_full_name
-            AND target.{id_col} = source.{id_col}
+            target.repo_id = src.repo_id
+            AND target.{id_col} = src.{id_col}
+            AND target.is_current = true
             """
         )
-        .whenMatchedUpdateAll()
-        .whenNotMatchedInsertAll()
+        .whenMatchedUpdate(set={
+            "is_current": F.lit(False),
+            "valid_to": F.col("src.new_updated_at"),
+        })
         .execute()
     )
+
+    # Step 2: append new current-version rows — brand-new entities and
+    # superseding versions of changed entities. Stale (older updated_at) or
+    # unchanged rows are excluded from both filters, so they're simply
+    # dropped here — never written at all.
+    rows_to_insert = (
+        joined
+        .filter(needs_new_version)
+        .select("s.*")
+        .withColumn("valid_from", F.col("updated_at"))
+        .withColumn("valid_to", F.lit(None).cast("timestamp"))
+        .withColumn("is_current", F.lit(True))
+    )
+
+    (
+        rows_to_insert.write
+        .format("delta")
+        .mode("append")
+        .save(path)
+    )
+
+    joined.unpersist()
 
 '''
 def write_silver_data(df, path, table_name, process_date):
@@ -377,8 +450,8 @@ def write_silver_data(df, path, table_name, process_date):
         df.write
         .format("delta")
         .mode("overwrite")
-        .option("replaceWhere", f"snapshot_date = '{process_date}'")
-        .partitionBy("snapshot_date")
+        .option("replaceWhere", f"batch_date = '{process_date}'")
+        .partitionBy("batch_date")
         .save(path)
     )
 
@@ -483,8 +556,8 @@ def main():
             pulls_df, job_run_id, "pulls", "pull_id"
         )
 
-        write_silver_data(spark, issues_df, issues_silver_path, "issue_id")
-        write_silver_data(spark, pulls_df, pulls_silver_path, "pull_id")
+        write_silver_data(spark, issues_df, issues_silver_path, "issue_id", ISSUES_TRACKED_COLUMNS)
+        write_silver_data(spark, pulls_df, pulls_silver_path, "pull_id", PULLS_TRACKED_COLUMNS)
         issues_df.unpersist()
         pulls_df.unpersist()
 
