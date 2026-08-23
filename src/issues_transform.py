@@ -184,7 +184,6 @@ def transform_issues_and_prs(bronze_df, run_ts):
         .select(
             F.to_timestamp("fetched_at").alias("bronze_ingested_at"),
             F.to_timestamp("batch_timestamp").alias("bronze_batch_timestamp"),
-            F.col("fetched_at"),
             F.concat_ws("/", F.col("owner"), F.col("repo")).alias("repo_full_name"),
 
             F.col("issue_record.url").alias("api_url"),
