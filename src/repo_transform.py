@@ -294,16 +294,16 @@ def transform_repo_metadata(bronze_df, run_ts):
             F.to_timestamp("batch_timestamp").alias("bronze_batch_timestamp")
         )
         .withColumn("silver_ingested_at", F.lit(run_ts).cast("timestamp"))
-        .withColumn("snapshot_date", F.to_date("bronze_batch_timestamp"))
+        .withColumn("batch_date", F.to_date("bronze_batch_timestamp"))
 
     )
 
 
 def dedupe(df):
-    # dedupe by repo_id and snapshot_date, keep the latest record based on bronze_ingested_at timestamp  
+    # dedupe by repo_id and batch_date, keep the latest record based on bronze_ingested_at timestamp  
     window_spec = (
     Window
-    .partitionBy("repo_id", "snapshot_date")
+    .partitionBy("repo_id", "batch_date")
     .orderBy(F.col("bronze_ingested_at").desc())
     )
 
@@ -321,25 +321,25 @@ def write_silver_data(df, process_date, owner: str | None = None, repo: str | No
 
     if owner and repo:
         # Scoped run: only replace this repo's row within the date partition,
-        # so other repos' rows for the same snapshot_date aren't wiped out.
+        # so other repos' rows for the same batch_date aren't wiped out.
         repo_full_name = f"{owner}/{repo}"
-        replace_where = f"snapshot_date = '{process_date}' AND repo_full_name = '{repo_full_name}'"
+        replace_where = f"batch_date = '{process_date}' AND repo_full_name = '{repo_full_name}'"
     else:
-        replace_where = f"snapshot_date = '{process_date}'"
+        replace_where = f"batch_date = '{process_date}'"
 
     (
         df.write
         .mode("overwrite")
         .option("replaceWhere", replace_where)
-        .partitionBy("snapshot_date")
+        .partitionBy("batch_date")
         .format("delta")
         .save(silver_path)
     )
-    # when u partition by snapshot_date, it will create subdirectories like snapshot_date=2026-04-06/ and put the parquet files there.
-    # no snapshot_date column in parquet, but when it's read back, snapshot_date will be a column again 
+    # when u partition by batch_date, it will create subdirectories like batch_date=2026-04-06/ and put the parquet files there.
+    # no batch_date column in parquet, but when it's read back, batch_date will be a column again 
 
 def run_data_quality_checks(df, job_run_id):
-    required_columns = ["repo_id", "repo_full_name", "repo_url", "snapshot_date"]
+    required_columns = ["repo_id", "repo_full_name", "repo_url", "batch_date"]
 
     # Single scan of df instead of one .count()/.filter().count() per metric.
     metrics = (
@@ -475,7 +475,7 @@ if __name__ == "__main__":
 from pyspark.sql.window import Window
 import pyspark.sql.functions as F
 
-window_spec = Window.partitionBy("repo_id", "snapshot_date").orderBy(F.col("bronze_ingested_at").desc())
+window_spec = Window.partitionBy("repo_id", "batch_date").orderBy(F.col("bronze_ingested_at").desc())
 
 daily_latest_df = (
     silver_df
