@@ -251,7 +251,7 @@ def transform_commits(bronze_df, run_ts):
 
         )
         .withColumn("silver_ingested_at", F.lit(run_ts).cast("timestamp"))
-        .withColumn("snapshot_date", F.to_date("bronze_batch_timestamp"))
+        .withColumn("batch_date", F.to_date("bronze_batch_timestamp"))
     )
 
 
@@ -281,7 +281,7 @@ def enrich_with_repo_id(commits_df, repo_metadata_df):
     window_spec = (
         Window
         .partitionBy("repo_full_name")
-        .orderBy(F.col("snapshot_date").desc())
+        .orderBy(F.col("batch_date").desc())
     )
 
     repo_lookup_df = (
@@ -289,14 +289,14 @@ def enrich_with_repo_id(commits_df, repo_metadata_df):
         .select(
             "repo_id",
             "repo_full_name",
-            "snapshot_date"
+            "batch_date"
         )
         .withColumn(
             "rn",
             F.row_number().over(window_spec)
         )
         .filter(F.col("rn") == 1)
-        .drop("rn", "snapshot_date")
+        .drop("rn", "batch_date")
     )
 
     return (
@@ -313,9 +313,10 @@ def enrich_with_repo_id(commits_df, repo_metadata_df):
     )
 
 def run_data_quality_checks(df, job_run_id):
-    required_columns = ["commit_id", "repo_full_name", "url", "snapshot_date"]
+    required_columns = ["commit_id", "repo_full_name", "repo_id", "url", "batch_date"]
 
-    # Single scan of df for row count + null counts + missing_repo_id_count.
+    # Single scan of df for row count + null counts (repo_id included, since
+    # it's now the merge key — a null repo_id must be a hard failure).
     metrics = (
         df.agg(
             F.count("*").alias("row_count"),
@@ -326,10 +327,6 @@ def run_data_quality_checks(df, job_run_id):
                 ).alias(f"{col_name}_null_count")
                 for col_name in required_columns
             ],
-
-            F.sum(
-                F.when(F.col("repo_id").isNull(), 1).otherwise(0)
-            ).alias("missing_repo_id_count"),
         )
         .first()
     )
@@ -353,8 +350,9 @@ def run_data_quality_checks(df, job_run_id):
             )
 
     # Duplicate check needs a groupBy, so it stays a separate aggregation.
+    # Keyed on repo_id (not repo_full_name) to match the merge key below.
     duplicate_count = (
-        df.groupBy("repo_full_name", "commit_id","snapshot_date")
+        df.groupBy("repo_id", "commit_id","batch_date")
         .count()
         .filter(F.col("count") > 1)
         .count()
@@ -367,13 +365,10 @@ def run_data_quality_checks(df, job_run_id):
             f"Data quality check failed: found {duplicate_count} duplicate commit groups."
         )
 
-    missing_repo_id_count = metrics["missing_repo_id_count"]
-    logger.info(f"job_run_id={job_run_id} missing_repo_id_count={missing_repo_id_count}")
-
     return silver_row_count
 
 
-#df.write.mode("overwrite").partitionBy("snapshot_date").format("delta").save(silver_path)
+#df.write.mode("overwrite").partitionBy("batch_date").format("delta").save(silver_path)
 '''
 def build_replace_where(
     process_date: str,
@@ -383,11 +378,11 @@ def build_replace_where(
     if owner and repo:
         repo_full_name = f"{owner}/{repo}"
         return (
-            f"snapshot_date = DATE '{process_date}' "
+            f"batch_date = DATE '{process_date}' "
             f"AND repo_full_name = '{repo_full_name}'"
         )
 
-    return f"snapshot_date = DATE '{process_date}'"
+    return f"batch_date = DATE '{process_date}'"
 '''
 '''
 def write_silver_data(df, process_date):
@@ -397,8 +392,8 @@ def write_silver_data(df, process_date):
         df.write
         .format("delta")
         .mode("overwrite")
-        .option("replaceWhere", f"snapshot_date = '{process_date}'")
-        .partitionBy("snapshot_date")
+        .option("replaceWhere", f"batch_date = '{process_date}'")
+        .partitionBy("batch_date")
         .save(silver_path)
     )
 '''
@@ -409,23 +404,25 @@ def write_silver_data(spark, df):
         (
             df.write
             .format("delta")
-            .partitionBy("snapshot_date")
+            .partitionBy("batch_date")
             .save(silver_path)
         )
         return
 
     target = DeltaTable.forPath(spark, silver_path)
 
+    # Commits are immutable: same repo_id + commit_id already present means
+    # this commit was already written, so do nothing — no matched clause at
+    # all, only insert commits that don't exist yet.
     (
         target.alias("target")
         .merge(
             df.alias("source"),
             """
-            target.repo_full_name = source.repo_full_name
+            target.repo_id = source.repo_id
             AND target.commit_id = source.commit_id
             """
         )
-        .whenMatchedUpdateAll()
         .whenNotMatchedInsertAll()
         .execute()
     )
